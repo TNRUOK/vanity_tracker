@@ -4,10 +4,16 @@
 [![Dart](https://img.shields.io/badge/Dart-3.0%2B-0175C2?logo=dart&logoColor=white)](https://dart.dev)
 [![Platform](https://img.shields.io/badge/Platform-Android%20%7C%20iOS-brightgreen)](#)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Download APK](https://img.shields.io/badge/Direct%20Download-Android%20APK-E06D83?style=flat&logo=android&logoColor=white)](https://github.com/TNRUOK/vanity_tracker/raw/main/vanity-tracker.apk)
 
-**Vanity Tracker** is an elegant, privacy-focused cosmetics and skincare management mobile application built with Flutter. It solves the everyday dilemma of beauty enthusiasts: tracking cosmetic expiration dates via **Period After Opening (PAO)**, avoiding expired formula breakouts, preventing duplicate purchases, monitoring finished products ("Empties"), and calculating accurate **cost-per-day** economics.
+> ### 📲 Quick Install: Ready-to-Run Android APK
+> You can download and install the app directly on your Android phone without building from source:  
+> 🔗 [**Download vanity-tracker.apk (Direct Download)**](https://github.com/TNRUOK/vanity_tracker/raw/main/vanity-tracker.apk)
+> 
+> *To install: Download the `.apk` on your Android device, tap the file in Downloads, and choose **Install** (allow "Install unknown apps" if prompted).*
 
 ---
+
 
 ## 🌟 Key Features
 
