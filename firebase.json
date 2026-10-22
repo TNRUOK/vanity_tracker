@@ -1,11 +1,19 @@
 {
   "flutter": {
     "platforms": {
+      "android": {
+        "default": {
+          "projectId": "vanitytracker",
+          "appId": "1:208239607216:android:97148ef6ede26f446baa75",
+          "fileOutput": "android/app/google-services.json"
+        }
+      },
       "dart": {
         "lib/firebase_options.dart": {
-          "projectId": "vanity-tracker",
+          "projectId": "vanitytracker",
           "configurations": {
-            "web": "1:999868479138:web:6f0f0f00cfc6ca5abec9fb"
+            "android": "1:208239607216:android:97148ef6ede26f446baa75",
+            "web": "1:208239607216:web:91cbed3d424e9c936baa75"
           }
         }
       }

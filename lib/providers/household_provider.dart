@@ -299,6 +299,85 @@ class HouseholdProvider extends ChangeNotifier {
     }
   }
 
+  /// Join a household directly using its room code (e.g. VAN-7892)
+  Future<bool> joinByRoomCode(String roomCode, UserModel user) async {
+    _isLoading = true;
+    _errorMessage = null;
+    notifyListeners();
+
+    try {
+      final joined = await _service.joinHouseholdByRoomCode(
+        roomCode: roomCode,
+        user: user,
+      );
+      _currentHousehold = joined;
+      await _loadHouseholdDetails(user);
+      _isLoading = false;
+      notifyListeners();
+      return true;
+    } catch (e) {
+      _errorMessage = _clean(e);
+      _isLoading = false;
+      notifyListeners();
+      return false;
+    }
+  }
+
+  /// Regenerate the room code for the current household (owner only)
+  Future<String?> regenerateRoomCode(UserModel owner) async {
+    if (_currentHousehold == null) return null;
+    _isLoading = true;
+    _errorMessage = null;
+    notifyListeners();
+
+    try {
+      final newCode = await _service.regenerateRoomCode(
+        household: _currentHousehold!,
+        owner: owner,
+      );
+      _currentHousehold = _currentHousehold!.copyWith(roomCode: newCode);
+      _isLoading = false;
+      notifyListeners();
+      return newCode;
+    } catch (e) {
+      _errorMessage = _clean(e);
+      _isLoading = false;
+      notifyListeners();
+      return null;
+    }
+  }
+
+  /// Remove a member from the household (owner only)
+  Future<bool> removeMember(String memberUid, UserModel owner) async {
+    if (_currentHousehold == null) return false;
+    _isLoading = true;
+    _errorMessage = null;
+    notifyListeners();
+
+    try {
+      await _service.removeMember(
+        householdId: _currentHousehold!.householdId,
+        memberUidToRemove: memberUid,
+        owner: owner,
+      );
+      final updatedUids = List<String>.from(_currentHousehold!.memberUids)..remove(memberUid);
+      final updatedEmails = Map<String, String>.from(_currentHousehold!.memberEmails)..remove(memberUid);
+      _currentHousehold = _currentHousehold!.copyWith(
+        memberUids: updatedUids,
+        memberEmails: updatedEmails,
+      );
+      await _loadHouseholdDetails(owner);
+      _isLoading = false;
+      notifyListeners();
+      return true;
+    } catch (e) {
+      _errorMessage = _clean(e);
+      _isLoading = false;
+      notifyListeners();
+      return false;
+    }
+  }
+
   /// Toggle item sharing status with authorization check
   Future<VanityItemModel> toggleItemShare({
     required VanityItemModel item,

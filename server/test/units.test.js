@@ -10,8 +10,8 @@ import { describeSmtpError } from '../src/mailer.js';
 describe('Firebase ID token verification', async () => {
   const { publicKey, privateKey } = await generateKeyPair('RS256');
   const jwk = { ...(await exportJWK(publicKey)), kid: 'k1', alg: 'RS256' };
-  const verify = createFirebaseTokenVerifier('vanity-tracker', createLocalJWKSet({ keys: [jwk] }));
-  const sign = (claims, { project = 'vanity-tracker', exp = '1h' } = {}) =>
+  const verify = createFirebaseTokenVerifier('vanitytracker', createLocalJWKSet({ keys: [jwk] }));
+  const sign = (claims, { project = 'vanitytracker', exp = '1h' } = {}) =>
     new SignJWT(claims)
       .setProtectedHeader({ alg: 'RS256', kid: 'k1' })
       .setIssuer(`https://securetoken.google.com/${project}`)
@@ -27,7 +27,7 @@ describe('Firebase ID token verification', async () => {
   });
 
   it('rejects tokens for another Firebase project', async () => {
-    await assert.rejects(verify(await sign({}, { project: 'vanitytracker' })), /rejected/);
+    await assert.rejects(verify(await sign({}, { project: 'other-firebase-project' })), /rejected/);
   });
 
   it('rejects expired tokens', async () => {
@@ -92,7 +92,7 @@ describe('Firestore REST client', () => {
       calls.push({ url, init });
       return { ok: true, status: 200, json: async () => ({ fields: { status: { stringValue: 'pending' } } }) };
     };
-    const c = createFirestoreRestClient('vanity-tracker', fetchImpl);
+    const c = createFirestoreRestClient('vanitytracker', fetchImpl);
     await c.updateFields('household_invitations', 'inv_1', { email_delivery_status: 'sent' }, 'tok');
     assert.match(calls[0].url, /updateMask.fieldPaths=email_delivery_status/);
     assert.match(calls[0].url, /currentDocument.exists=true/);

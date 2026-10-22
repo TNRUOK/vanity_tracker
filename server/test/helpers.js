@@ -81,7 +81,7 @@ export function baseDocs(overrides = {}) {
 /** Starts the app on an ephemeral port. Tokens are "token-<uid>" mapped to users. */
 export async function startTestServer({ docs = baseDocs(), env = {}, transport = fakeTransport(), users = [OWNER, OTHER] } = {}) {
   const config = buildConfig({
-    FIREBASE_PROJECT_ID: 'vanity-tracker',
+    FIREBASE_PROJECT_ID: 'vanitytracker',
     GMAIL_USER: 'sender@gmail.com',
     GMAIL_APP_PASSWORD: 'test-only-not-a-real-password',
     RESEND_COOLDOWN_SECONDS: '60',

@@ -368,7 +368,7 @@ void main() {
       final down = senderWith(MockClient((_) async => throw http.ClientException('refused')));
       final r = await down.sendInvitationEmail('inv_1');
       expect(r.status, EmailDeliveryStatus.failed);
-      expect(r.error, contains('npm start'));
+      expect(r.error, contains('Could not reach the invitation email server'));
 
       final noToken = senderWith(MockClient((_) async => http.Response('{}', 200)), token: null);
       expect((await noToken.sendInvitationEmail('inv_1')).status, EmailDeliveryStatus.failed);

@@ -50,20 +50,20 @@ class DefaultFirebaseOptions {
   }
 
   static const FirebaseOptions web = FirebaseOptions(
-    apiKey: 'AIzaSyAc5zVgaCK3CRcjsXeVTMPvJ6ToY4i7pXY',
-    appId: '1:999868479138:web:6f0f0f00cfc6ca5abec9fb',
-    messagingSenderId: '999868479138',
-    projectId: 'vanity-tracker',
-    authDomain: 'vanity-tracker.firebaseapp.com',
-    storageBucket: 'vanity-tracker.firebasestorage.app',
-    measurementId: 'G-GNYJ9BWYNV',
+    apiKey: 'AIzaSyAe22dgcDQCU8GbsZ8yTTAw1FrxtPOmD-k',
+    appId: '1:208239607216:web:91cbed3d424e9c936baa75',
+    messagingSenderId: '208239607216',
+    projectId: 'vanitytracker',
+    authDomain: 'vanitytracker.firebaseapp.com',
+    storageBucket: 'vanitytracker.firebasestorage.app',
+    measurementId: 'G-XT0J5STL8M',
   );
 
   static const FirebaseOptions android = FirebaseOptions(
-    apiKey: 'AIzaSyAc5zVgaCK3CRcjsXeVTMPvJ6ToY4i7pXY',
-    appId: '1:999868479138:android:6f0f0f00cfc6ca5abec9fb',
-    messagingSenderId: '999868479138',
-    projectId: 'vanity-tracker',
-    storageBucket: 'vanity-tracker.firebasestorage.app',
+    apiKey: 'AIzaSyBqj4_QP5KRp7mQ9n7qqQmuL3WLR_fOs8A',
+    appId: '1:208239607216:android:97148ef6ede26f446baa75',
+    messagingSenderId: '208239607216',
+    projectId: 'vanitytracker',
+    storageBucket: 'vanitytracker.firebasestorage.app',
   );
 }

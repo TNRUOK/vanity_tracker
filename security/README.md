@@ -22,7 +22,7 @@ firebase emulators:exec --only firestore --project demo-vanity-test "node securi
 `exists()` mocked). Batched writes and queries are only approximated here.
 
 ```
-node security/run_rules_tests.js vanity-tracker firestore.rules
+node security/run_rules_tests.js vanitytracker firestore.rules
 ```
 
 Needs the Firebase CLI to be logged in with access to the project. (On Windows, Node may

@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:math' as math;
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -20,6 +21,14 @@ class EmailNotVerifiedException implements Exception {
   String toString() =>
       'Please verify your e-mail address ($email) first: open the link we sent you, then tap '
       '"I\'ve verified my e-mail" and try again. Your invitation stays waiting for you.';
+}
+
+/// Generates a clean 6-character room code prefixed with VAN- (e.g. VAN-7892).
+String generateHouseholdRoomCode() {
+  const chars = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+  final rand = math.Random.secure();
+  final code = List.generate(4, (_) => chars[rand.nextInt(chars.length)]).join();
+  return 'VAN-$code';
 }
 
 /// The one field-level update a departing member may make to a household document: only
@@ -107,6 +116,7 @@ class HouseholdService {
     }
 
     final householdId = 'hh_${DateTime.now().millisecondsSinceEpoch}_${_uuid.v4().substring(0, 6)}';
+    final roomCode = generateHouseholdRoomCode();
     final newHousehold = HouseholdModel(
       householdId: householdId,
       name: name.trim().isNotEmpty ? name.trim() : 'My Household',
@@ -114,20 +124,33 @@ class HouseholdService {
       createdAt: DateTime.now(),
       memberUids: [creator.userId],
       memberEmails: {creator.userId: normalizeEmail(creator.email)},
+      roomCode: roomCode,
     );
 
     if (isFirebaseAvailable) {
       try {
-        await _firestore
-            .collection('households')
-            .doc(householdId)
-            .set(newHousehold.toMap());
-
-        // Update user record with household_id so the household is found again after restart.
-        await _firestore
-            .collection('users')
-            .doc(creator.userId)
-            .set({'household_id': householdId}, SetOptions(merge: true));
+        final batch = _firestore.batch();
+        batch.set(
+          _firestore.collection('households').doc(householdId),
+          newHousehold.toMap(),
+        );
+        batch.set(
+          _firestore.collection('household_room_codes').doc(roomCode),
+          {
+            'room_code': roomCode,
+            'household_id': householdId,
+            'household_name': newHousehold.name,
+            'created_by': creator.userId,
+            'created_at': DateTime.now().toIso8601String(),
+            'is_active': true,
+          },
+        );
+        batch.set(
+          _firestore.collection('users').doc(creator.userId),
+          {'household_id': householdId},
+          SetOptions(merge: true),
+        );
+        await batch.commit();
       } catch (e) {
         debugPrint('Firestore createHousehold error: $e');
         throw Exception('Could not create household: ${_describeFirestoreError(e)}');
@@ -170,6 +193,24 @@ class HouseholdService {
     if (!household.isMember(currentUserId)) {
       debugPrint('Security warning: user $currentUserId is not an authorized member of household $householdId');
       throw Exception('Unauthorized: You are not an authorized member of this household.');
+    }
+
+    // If household has no room code yet and current user is owner, generate and save one
+    if (household.roomCode.isEmpty && household.isOwner(currentUserId)) {
+      final code = generateHouseholdRoomCode();
+      household = household.copyWith(roomCode: code);
+      if (isFirebaseAvailable) {
+        _firestore.collection('households').doc(householdId).update({'room_code': code}).catchError((_) {});
+        _firestore.collection('household_room_codes').doc(code).set({
+          'room_code': code,
+          'household_id': householdId,
+          'household_name': household.name,
+          'created_by': currentUserId,
+          'created_at': DateTime.now().toIso8601String(),
+          'is_active': true,
+        }).catchError((_) {});
+      }
+      _localHouseholds[householdId] = household;
     }
 
     return household;
@@ -653,7 +694,12 @@ class HouseholdService {
     if (updatedUids.isEmpty) {
       // Household is empty, delete it
       if (isFirebaseAvailable) {
-        await _firestore.collection('households').doc(householdId).delete();
+        final batch = _firestore.batch();
+        batch.delete(_firestore.collection('households').doc(householdId));
+        if (household.roomCode.isNotEmpty) {
+          batch.delete(_firestore.collection('household_room_codes').doc(household.roomCode));
+        }
+        await batch.commit();
       }
       _localHouseholds.remove(householdId);
     } else {
@@ -683,6 +729,188 @@ class HouseholdService {
       await _firestore.collection('users').doc(user.userId).set({'household_id': FieldValue.delete()}, SetOptions(merge: true));
     }
 
+    await _saveLocalCache();
+  }
+
+  /// Join a household directly using its room code (e.g. VAN-7892).
+  Future<HouseholdModel> joinHouseholdByRoomCode({
+    required String roomCode,
+    required UserModel user,
+  }) async {
+    if (user.userId.isEmpty) {
+      throw Exception('Sign in required to join a household.');
+    }
+    final cleanCode = roomCode.trim().toUpperCase();
+    if (cleanCode.isEmpty) {
+      throw Exception('Please enter a valid room code.');
+    }
+
+    // Check if user is already in a household
+    final current = await findHouseholdForUser(user);
+    if (current != null) {
+      throw Exception('You are already in "${current.name}". Leave it before joining another household.');
+    }
+
+    final email = normalizeEmail(user.email);
+    String targetHouseholdId = '';
+    String targetHouseholdName = '';
+
+    if (isFirebaseAvailable) {
+      try {
+        final codeDoc = await _firestore.collection('household_room_codes').doc(cleanCode).get();
+        if (!codeDoc.exists || codeDoc.data() == null) {
+          throw Exception('Room code "$cleanCode" not found. Please verify the code with the household owner.');
+        }
+        final data = codeDoc.data()!;
+        if (data['is_active'] != true) {
+          throw Exception('This room code is no longer active.');
+        }
+        targetHouseholdId = data['household_id']?.toString() ?? '';
+        targetHouseholdName = data['household_name']?.toString() ?? 'Household';
+        if (targetHouseholdId.isEmpty) {
+          throw Exception('Invalid room code reference.');
+        }
+
+        // Add member via batch update
+        final batch = _firestore.batch();
+        batch.update(_firestore.collection('households').doc(targetHouseholdId), {
+          'member_uids': FieldValue.arrayUnion([user.userId]),
+          'member_emails.${user.userId}': email,
+          'last_join_room_code': cleanCode,
+        });
+        batch.set(
+          _firestore.collection('users').doc(user.userId),
+          {'household_id': targetHouseholdId},
+          SetOptions(merge: true),
+        );
+        await batch.commit();
+      } on FirebaseException catch (e) {
+        debugPrint('Firestore joinHouseholdByRoomCode error: $e');
+        if (e.code == 'not-found') throw Exception('Household no longer exists.');
+        throw Exception('Could not join household: ${_describeFirestoreError(e)}');
+      }
+
+      final joined = await getHousehold(targetHouseholdId, currentUserId: user.userId);
+      if (joined == null) {
+        throw Exception('Joined "$targetHouseholdName", but details could not be loaded. Pull to refresh.');
+      }
+      _localHouseholds[joined.householdId] = joined;
+      await _saveLocalCache();
+      return joined;
+    }
+
+    // Local / Offline fallback for tests
+    HouseholdModel? localTarget;
+    for (final hh in _localHouseholds.values) {
+      if (hh.roomCode.toUpperCase() == cleanCode) {
+        localTarget = hh;
+        break;
+      }
+    }
+    if (localTarget == null) {
+      throw Exception('Room code "$cleanCode" not found. Please verify the code with the household owner.');
+    }
+    final updatedUids = List<String>.from(localTarget.memberUids);
+    if (!updatedUids.contains(user.userId)) updatedUids.add(user.userId);
+    final updatedEmails = Map<String, String>.from(localTarget.memberEmails)..[user.userId] = email;
+    final updated = localTarget.copyWith(memberUids: updatedUids, memberEmails: updatedEmails);
+    _localHouseholds[localTarget.householdId] = updated;
+    await _saveLocalCache();
+    return updated;
+  }
+
+  /// Regenerate the room code for a household (only the owner can do this).
+  Future<String> regenerateRoomCode({
+    required HouseholdModel household,
+    required UserModel owner,
+  }) async {
+    if (!household.isOwner(owner.userId)) {
+      throw Exception('Unauthorized: Only the household owner can regenerate the room code.');
+    }
+    final newCode = generateHouseholdRoomCode();
+    final oldCode = household.roomCode;
+
+    if (isFirebaseAvailable) {
+      final batch = _firestore.batch();
+      if (oldCode.isNotEmpty) {
+        batch.delete(_firestore.collection('household_room_codes').doc(oldCode));
+      }
+      batch.set(_firestore.collection('household_room_codes').doc(newCode), {
+        'room_code': newCode,
+        'household_id': household.householdId,
+        'household_name': household.name,
+        'created_by': owner.userId,
+        'created_at': DateTime.now().toIso8601String(),
+        'is_active': true,
+      });
+      batch.update(_firestore.collection('households').doc(household.householdId), {
+        'room_code': newCode,
+      });
+      await batch.commit();
+    }
+
+    final updated = household.copyWith(roomCode: newCode);
+    _localHouseholds[household.householdId] = updated;
+    await _saveLocalCache();
+    return newCode;
+  }
+
+  /// Remove a member from the household (only the household owner can do this).
+  Future<void> removeMember({
+    required String householdId,
+    required String memberUidToRemove,
+    required UserModel owner,
+  }) async {
+    if (memberUidToRemove == owner.userId) {
+      throw Exception('As owner, you cannot remove yourself. Use "Leave" to transfer ownership or delete the household.');
+    }
+
+    HouseholdModel? household;
+    if (isFirebaseAvailable) {
+      final doc = await _firestore.collection('households').doc(householdId).get();
+      if (doc.exists && doc.data() != null) {
+        household = HouseholdModel.fromMap(doc.data()!, doc.id);
+      }
+    } else {
+      household = _localHouseholds[householdId];
+    }
+
+    if (household == null) throw Exception('Household not found.');
+
+    if (!household.isOwner(owner.userId)) {
+      throw Exception('Unauthorized: Only the household owner can remove members.');
+    }
+
+    if (!household.isMember(memberUidToRemove)) {
+      throw Exception('User is not a member of this household.');
+    }
+
+    // Revoke sharing on all items owned by the removed user in this household
+    await unshareAllItemsForUser(memberUidToRemove, householdId);
+
+    final updatedUids = List<String>.from(household.memberUids)..remove(memberUidToRemove);
+    final updatedEmails = Map<String, String>.from(household.memberEmails)..remove(memberUidToRemove);
+
+    final updatedHousehold = household.copyWith(
+      memberUids: updatedUids,
+      memberEmails: updatedEmails,
+    );
+
+    if (isFirebaseAvailable) {
+      final batch = _firestore.batch();
+      batch.update(_firestore.collection('households').doc(householdId), {
+        'member_uids': FieldValue.arrayRemove([memberUidToRemove]),
+        'member_emails.$memberUidToRemove': FieldValue.delete(),
+      });
+      batch.set(
+        _firestore.collection('users').doc(memberUidToRemove),
+        {'household_id': FieldValue.delete()},
+        SetOptions(merge: true),
+      );
+      await batch.commit();
+    }
+
+    _localHouseholds[householdId] = updatedHousehold;
     await _saveLocalCache();
   }
 

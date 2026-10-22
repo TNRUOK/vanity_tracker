@@ -2,7 +2,7 @@
 // `projects.test` method (Google's rules engine). It does NOT deploy rules and does NOT
 // read or write any Firestore data. Uses the Firebase CLI login; never prints tokens.
 //
-//   node security/run_rules_tests.js vanity-tracker firestore.rules
+//   node security/run_rules_tests.js vanitytracker firestore.rules
 //
 // Exit code 0 only when every case matches its expected ALLOW/DENY.
 const fs = require('fs');

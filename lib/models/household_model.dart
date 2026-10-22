@@ -5,6 +5,7 @@ class HouseholdModel {
   final DateTime createdAt;
   final List<String> memberUids;
   final Map<String, String> memberEmails; // userId -> email/display name
+  final String roomCode; // Short code for instant joining (e.g. VAN-7892)
 
   const HouseholdModel({
     required this.householdId,
@@ -13,6 +14,7 @@ class HouseholdModel {
     required this.createdAt,
     this.memberUids = const [],
     this.memberEmails = const {},
+    this.roomCode = '',
   });
 
   bool isOwner(String userId) => createdBy == userId;
@@ -26,6 +28,7 @@ class HouseholdModel {
       'created_at': createdAt.toIso8601String(),
       'member_uids': memberUids,
       'member_emails': memberEmails,
+      if (roomCode.isNotEmpty) 'room_code': roomCode,
     };
   }
 
@@ -40,6 +43,7 @@ class HouseholdModel {
       createdAt: map['created_at'] != null ? DateTime.tryParse(map['created_at']) ?? DateTime.now() : DateTime.now(),
       memberUids: membersList,
       memberEmails: emailMap,
+      roomCode: map['room_code']?.toString() ?? '',
     );
   }
 
@@ -50,6 +54,7 @@ class HouseholdModel {
     DateTime? createdAt,
     List<String>? memberUids,
     Map<String, String>? memberEmails,
+    String? roomCode,
   }) {
     return HouseholdModel(
       householdId: householdId ?? this.householdId,
@@ -58,6 +63,7 @@ class HouseholdModel {
       createdAt: createdAt ?? this.createdAt,
       memberUids: memberUids ?? this.memberUids,
       memberEmails: memberEmails ?? this.memberEmails,
+      roomCode: roomCode ?? this.roomCode,
     );
   }
 }

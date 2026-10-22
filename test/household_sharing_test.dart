@@ -411,6 +411,149 @@ void main() {
     });
   });
 
+  group('Room Code & Owner Member Removal Tests', () {
+    const alice = UserModel(
+      userId: 'user_alice',
+      email: 'alice@example.com',
+      name: 'Alice',
+    );
+
+    const bob = UserModel(
+      userId: 'user_bob',
+      email: 'bob@example.com',
+      name: 'Bob',
+    );
+
+    const charlie = UserModel(
+      userId: 'user_charlie',
+      email: 'charlie@example.com',
+      name: 'Charlie',
+    );
+
+    test('generateHouseholdRoomCode produces formatted code VAN-XXXX with valid charset', () {
+      final code = generateHouseholdRoomCode();
+      expect(code, startsWith('VAN-'));
+      expect(code.length, 8); // 'VAN-' + 4 chars
+      final suffix = code.substring(4);
+      final validChars = RegExp(r'^[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{4}$');
+      expect(validChars.hasMatch(suffix), isTrue);
+    });
+
+    test('createHousehold generates a roomCode on creation', () async {
+      final service = HouseholdService();
+      final hh = await service.createHousehold(name: 'Room Code House', creator: alice);
+      expect(hh.roomCode, isNotNull);
+      expect(hh.roomCode, startsWith('VAN-'));
+    });
+
+    test('joinHouseholdByRoomCode successfully joins user to household', () async {
+      final service = HouseholdService();
+      final hh = await service.createHousehold(name: 'Loft Suite', creator: alice);
+      final roomCode = hh.roomCode;
+
+      final joinedHh = await service.joinHouseholdByRoomCode(
+        roomCode: roomCode,
+        user: bob,
+      );
+
+      expect(joinedHh.householdId, hh.householdId);
+      expect(joinedHh.memberUids, contains('user_bob'));
+      expect(joinedHh.memberEmails['user_bob'], 'bob@example.com');
+    });
+
+    test('joinHouseholdByRoomCode fails with invalid or inactive room code', () async {
+      final service = HouseholdService();
+      expect(
+        () => service.joinHouseholdByRoomCode(roomCode: 'VAN-INVALID', user: bob),
+        throwsA(isA<Exception>()),
+      );
+    });
+
+    test('regenerateRoomCode creates new room code and invalidates old code', () async {
+      final service = HouseholdService();
+      final hh = await service.createHousehold(name: 'Secret Club', creator: alice);
+      final originalCode = hh.roomCode;
+
+      final newCode = await service.regenerateRoomCode(
+        household: hh,
+        owner: alice,
+      );
+
+      expect(newCode, isNot(equals(originalCode)));
+      expect(newCode, startsWith('VAN-'));
+
+      // Old code can no longer be used
+      expect(
+        () => service.joinHouseholdByRoomCode(roomCode: originalCode, user: bob),
+        throwsA(isA<Exception>()),
+      );
+
+      // New code can be used
+      final joinedHh = await service.joinHouseholdByRoomCode(roomCode: newCode, user: bob);
+      expect(joinedHh.memberUids, contains('user_bob'));
+    });
+
+    test('Non-owner cannot regenerate room code', () async {
+      final service = HouseholdService();
+      final hh = await service.createHousehold(name: 'Alice House', creator: alice);
+      expect(
+        () => service.regenerateRoomCode(household: hh, owner: bob),
+        throwsA(isA<Exception>()),
+      );
+    });
+
+    test('Owner can remove member and unshare their items', () async {
+      final service = HouseholdService();
+      final hh = await service.createHousehold(name: 'Shared Villa', creator: alice);
+      final joinedHh = await service.joinHouseholdByRoomCode(
+        roomCode: hh.roomCode,
+        user: bob,
+      );
+      expect(joinedHh.memberUids, contains('user_bob'));
+
+      // Owner removes Bob
+      await service.removeMember(
+        householdId: hh.householdId,
+        memberUidToRemove: 'user_bob',
+        owner: alice,
+      );
+
+      final updatedHh = (await service.getHousehold(hh.householdId, currentUserId: alice.userId))!;
+      expect(updatedHh.memberUids, isNot(contains('user_bob')));
+      expect(updatedHh.memberEmails.containsKey('user_bob'), isFalse);
+    });
+
+    test('Non-owner cannot remove member', () async {
+      final service = HouseholdService();
+      final hh = await service.createHousehold(name: 'Shared Villa', creator: alice);
+      await service.joinHouseholdByRoomCode(roomCode: hh.roomCode, user: bob);
+      await service.joinHouseholdByRoomCode(roomCode: hh.roomCode, user: charlie);
+
+      // Bob tries to remove Charlie
+      expect(
+        () => service.removeMember(
+          householdId: hh.householdId,
+          memberUidToRemove: 'user_charlie',
+          owner: bob,
+        ),
+        throwsA(isA<Exception>()),
+      );
+    });
+
+    test('Owner cannot remove self via removeMember', () async {
+      final service = HouseholdService();
+      final hh = await service.createHousehold(name: 'Shared Villa', creator: alice);
+      expect(
+        () => service.removeMember(
+          householdId: hh.householdId,
+          memberUidToRemove: 'user_alice',
+          owner: alice,
+        ),
+        throwsA(isA<Exception>()),
+      );
+    });
+  });
+
   group('Session Isolation & Cache Purge Tests', () {
     test('Signing out purges HouseholdProvider in-memory state', () async {
       final provider = HouseholdProvider();

@@ -55,6 +55,10 @@ service cloud.firestore {
       return /databases/$(database)/documents/household_invitations/$(invitationId);
     }
 
+    function roomCodePath(code) {
+      return /databases/$(database)/documents/household_room_codes/$(code);
+    }
+
     function isHouseholdMember(householdId) {
       return isAuthenticated() && householdId is string && exists(householdPath(householdId)) &&
         uid() in get(householdPath(householdId)).data.member_uids;
@@ -134,7 +138,7 @@ service cloud.firestore {
         // The owner can NOT add anyone (members join only through an invitation).
         (
           resource.data.created_by == uid() &&
-          changedKeys().hasOnly(['name', 'created_by', 'member_uids', 'member_emails']) &&
+          changedKeys().hasOnly(['name', 'created_by', 'member_uids', 'member_emails', 'room_code']) &&
           resource.data.member_uids.hasAll(request.resource.data.member_uids) &&
           resource.data.member_emails.keys().hasAll(request.resource.data.member_emails.keys()) &&
           request.resource.data.created_by in request.resource.data.member_uids
@@ -169,6 +173,20 @@ service cloud.firestore {
           getAfter(invitationPath(request.resource.data.last_join_invitation_id)).data.status == 'accepted' &&
           getAfter(invitationPath(request.resource.data.last_join_invitation_id)).data.household_id == householdId &&
           getAfter(invitationPath(request.resource.data.last_join_invitation_id)).data.invited_email == myEmail()
+        ) ||
+
+        // A user joins with an active room code: adds only themself, verified against household_room_codes.
+        (
+          isAuthenticated() &&
+          !(uid() in resource.data.member_uids) &&
+          changedKeys().hasOnly(['member_uids', 'member_emails', 'last_join_room_code']) &&
+          request.resource.data.member_uids.hasAll(resource.data.member_uids) &&
+          request.resource.data.member_uids.removeAll(resource.data.member_uids).hasOnly([uid()]) &&
+          request.resource.data.member_emails.diff(resource.data.member_emails).affectedKeys().hasOnly([uid()]) &&
+          request.resource.data.member_emails[uid()] == myEmail() &&
+          exists(roomCodePath(request.resource.data.last_join_room_code)) &&
+          get(roomCodePath(request.resource.data.last_join_room_code)).data.household_id == householdId &&
+          get(roomCodePath(request.resource.data.last_join_room_code)).data.is_active == true
         )
       );
 
@@ -283,6 +301,16 @@ service cloud.firestore {
       allow update: if isAuthenticated() &&
         resource.data.user_id == uid() &&
         request.resource.data.user_id == uid();
+    }
+
+    // --- Household Room Codes (Fast Join) ---
+    match /household_room_codes/{roomCode} {
+      allow read: if isAuthenticated();
+      allow create, update: if isAuthenticated() &&
+        isHouseholdOwner(request.resource.data.household_id) &&
+        request.resource.data.room_code == roomCode &&
+        request.resource.data.is_active is bool;
+      allow delete: if isAuthenticated() && isHouseholdOwner(resource.data.household_id);
     }
 
     // --- Legacy mail queue: no client access (the invite server sends directly) ---

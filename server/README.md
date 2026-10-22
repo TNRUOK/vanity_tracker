@@ -38,7 +38,7 @@ stored invitation and a fixed template.
    notepad .env
    ```
    Set `GMAIL_USER=` to the sending Gmail address and `GMAIL_APP_PASSWORD=` to the App
-   Password. Keep `FIREBASE_PROJECT_ID=vanity-tracker` (the project the web app uses).
+   Password. Keep `FIREBASE_PROJECT_ID=vanitytracker` (the project the web app uses).
    **Never paste the App Password into chat, the Flutter code, or Git.** `.env` is git-ignored.
    Optionally set `APP_URL=` to the **public** address of the web app (e.g.
    `https://your-app.web.app`). Invitation emails then show an **Open Vanity Tracker**
@@ -100,7 +100,7 @@ a Gmail inbox you control.
 
 ## Android & Mobile Testing
 
-Both the Android build and the Web app use the same Firebase project (`vanity-tracker`).
+Both the Android build and the Web app use the same Firebase project (`vanitytracker`).
 
 - **Android Emulator**: Reaches this server at `http://10.0.2.2:8787` by default without extra configuration.
 - **Physical Phone**:
