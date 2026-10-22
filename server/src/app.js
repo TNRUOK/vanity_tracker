@@ -40,6 +40,14 @@ export function createApp({ config, verifyIdToken, invitationService, mailer, lo
   });
 
   app.use(express.json({ limit: '4kb' }));
+ 
+  app.get('/', (_req, res) => {
+    res.json({
+      service: 'Vanity Tracker Invitation Server',
+      status: 'online',
+      health: '/api/health',
+    });
+  });
 
   app.get('/api/health', (_req, res) => {
     res.json({
