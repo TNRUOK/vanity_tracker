@@ -325,6 +325,54 @@ void main() {
       expect(await provider.acceptInvitation('inv_missing', bob), isFalse);
       expect(provider.errorMessage, contains('not found'));
     });
+
+    test('joinByRoomCode joins household and sets currentHousehold', () async {
+      final owner = HouseholdProvider();
+      await owner.createHousehold('Code Villa', alice);
+      final roomCode = owner.currentHousehold!.roomCode;
+
+      final joiner = HouseholdProvider();
+      final success = await joiner.joinByRoomCode(roomCode, bob);
+      expect(success, isTrue);
+      expect(joiner.hasHousehold, isTrue);
+      expect(joiner.currentHousehold!.memberUids, contains(bob.userId));
+    });
+
+    test('regenerateRoomCode updates code on provider and invalidates old code', () async {
+      final owner = HouseholdProvider();
+      await owner.createHousehold('Code Villa', alice);
+      final oldCode = owner.currentHousehold!.roomCode;
+
+      final newCode = await owner.regenerateRoomCode(alice);
+      expect(newCode, isNotNull);
+      expect(newCode, isNot(equals(oldCode)));
+      expect(owner.currentHousehold!.roomCode, newCode);
+
+      final joiner = HouseholdProvider();
+      final oldJoin = await joiner.joinByRoomCode(oldCode, bob);
+      expect(oldJoin, isFalse);
+      expect(joiner.errorMessage, contains('not found'));
+
+      final newJoin = await joiner.joinByRoomCode(newCode!, bob);
+      expect(newJoin, isTrue);
+    });
+
+    test('removeMember by owner removes user from household', () async {
+      final owner = HouseholdProvider();
+      await owner.createHousehold('Code Villa', alice);
+      final roomCode = owner.currentHousehold!.roomCode;
+
+      final joiner = HouseholdProvider();
+      await joiner.joinByRoomCode(roomCode, bob);
+
+      // Owner reloads to see bob
+      await owner.loadHouseholdData(alice);
+      expect(owner.currentHousehold!.memberUids, contains(bob.userId));
+
+      final removed = await owner.removeMember(bob.userId, alice);
+      expect(removed, isTrue);
+      expect(owner.currentHousehold!.memberUids, isNot(contains(bob.userId)));
+    });
   });
 
   group('BackendInvitationEmailSender (mock HTTP)', () {
