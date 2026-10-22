@@ -3,6 +3,7 @@ import '../theme/app_theme.dart';
 import 'dashboard/vanity_dashboard_screen.dart';
 import 'history/empties_screen.dart';
 import 'product/add_product_screen.dart';
+import 'routine/routine_screen.dart';
 import 'stats/stats_screen.dart';
 
 class MainNavigationScaffold extends StatefulWidget {
@@ -17,6 +18,7 @@ class _MainNavigationScaffoldState extends State<MainNavigationScaffold> {
 
   final List<Widget> _screens = const [
     VanityDashboardScreen(),
+    RoutineScreen(),
     EmptiesScreen(),
     StatsScreen(),
   ];
@@ -64,6 +66,11 @@ class _MainNavigationScaffoldState extends State<MainNavigationScaffold> {
               icon: Icon(Icons.spa_outlined),
               selectedIcon: Icon(Icons.spa, color: AppTheme.primaryRose),
               label: 'Vanity Shelf',
+            ),
+            NavigationDestination(
+              icon: Icon(Icons.schedule_outlined),
+              selectedIcon: Icon(Icons.schedule_rounded, color: AppTheme.primaryRose),
+              label: 'Routines',
             ),
             NavigationDestination(
               icon: Icon(Icons.recycling_outlined),

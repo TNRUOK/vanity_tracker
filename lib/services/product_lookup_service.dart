@@ -1,168 +1,541 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
 import '../models/category_model.dart';
+import 'category_classifier.dart';
 import '../models/product_model.dart';
+import '../utils/barcode_utils.dart';
+
+/// Overall outcome of a barcode lookup. Each is a different situation for the user:
+/// a bad number is not the same as a product missing from the databases.
+enum LookupStatus {
+  found,
+  notFound, // every database answered "no record" for a valid barcode
+  invalidFormat, // not an EAN/UPC barcode (letters, wrong length); nothing was looked up
+  invalidCheckDigit, // a digit is wrong somewhere; nothing was looked up
+  offline, // no database could be reached
+  timeout, // databases did not answer in time
+  unavailable, // some databases failed (server error / rate limit) and none had the product
+}
+
+/// What one database said, for diagnostics (no personal data).
+enum AttemptOutcome { found, notFound, rejected, serverError, rateLimited, timeout, unreachable, malformed }
+
+class LookupAttempt {
+  final String source;
+  final AttemptOutcome outcome;
+  final String? detail;
+  const LookupAttempt(this.source, this.outcome, [this.detail]);
+  @override
+  String toString() => '$source: ${outcome.name}${detail != null ? ' ($detail)' : ''}';
+}
+
+/// One product returned by a name/brand search.
+class ProductSearchCandidate {
+  final String barcode;
+  final String name;
+  final String brand;
+  final String? quantity;
+  final String? imageUrl;
+  const ProductSearchCandidate({
+    required this.barcode,
+    required this.name,
+    required this.brand,
+    this.quantity,
+    this.imageUrl,
+  });
+}
+
+class ProductSearchResult {
+  final List<ProductSearchCandidate> candidates;
+  final String? errorMessage;
+  const ProductSearchResult(this.candidates, [this.errorMessage]);
+}
 
 class ProductLookupResult {
+  /// True only when a real product record was found (curated catalog or an online
+  /// database). A barcode that was read but is unknown is `found: false`.
   final bool found;
+  final LookupStatus status;
+
+  /// What each database said (in order), for diagnostics.
+  final List<LookupAttempt> attempts;
+
+  /// Barcode format identified before the lookup (e.g. "EAN-13", "UPC-E").
+  final String? formatLabel;
   final ProductModel? product;
   final String? rawResponse;
   final String? errorMessage;
   final String? source;
 
+  /// Normalized digits that were looked up (null when the input was not a product barcode).
+  final String? barcode;
+
+  /// True when no online database could be reached at all (offline, DNS, timeouts).
+  final bool networkError;
+
+  /// True when the GS1 check digit does not match (likely a typo in manual entry).
+  final bool checkDigitInvalid;
+
+  /// Set when the result was served from this device's lookup cache (not fetched now).
+  final DateTime? cachedAt;
+
+  /// Required attribution for data from Open Beauty/Food/Products Facts (ODbL), or null.
+  final String? attribution;
+
+  /// Link to the source record, when there is one.
+  final String? sourceUrl;
+
   ProductLookupResult({
     required this.found,
+    LookupStatus? status,
+    this.attempts = const [],
+    this.formatLabel,
     this.product,
     this.rawResponse,
     this.errorMessage,
     this.source,
-  });
+    this.barcode,
+    this.networkError = false,
+    this.checkDigitInvalid = false,
+    this.cachedAt,
+    this.attribution,
+    this.sourceUrl,
+  }) : status = status ??
+            (found
+                ? LookupStatus.found
+                : (checkDigitInvalid
+                    ? LookupStatus.invalidCheckDigit
+                    : (networkError ? LookupStatus.offline : LookupStatus.notFound)));
+
+  bool get fromCache => cachedAt != null;
+
+  /// True when the record has no usable name or brand and the user must fill them in.
+  bool get hasMissingDetails =>
+      product != null && (product!.name.trim().isEmpty || product!.brand.trim().isEmpty);
 }
+
+/// Thrown internally when a database could not be reached (as opposed to "not found").
+class _Unreachable implements Exception {
+  final Object cause;
+  _Unreachable(this.cause);
+  bool get isTimeout => cause is TimeoutException;
+}
+
+/// An HTTP answer: status code and the decoded JSON object (null when the body was not a
+/// JSON object).
+typedef _JsonResponse = ({int statusCode, Map<String, dynamic>? json});
 
 class ProductLookupService {
   static const String _beautyFactsV2Url = 'https://world.openbeautyfacts.org/api/v2/product';
-  static const String _beautyFactsV0Url = 'https://world.openbeautyfacts.org/api/v0/product';
   static const String _foodFactsV2Url = 'https://world.openfoodfacts.org/api/v2/product';
   static const String _productsFactsV2Url = 'https://world.openproductsfacts.org/api/v2/product';
   static const String _upcItemDbUrl = 'https://api.upcitemdb.com/prod/trial/lookup';
 
-  /// Lookup a product by barcode across multiple databases + offline beauty intelligence catalog
-  static Future<ProductLookupResult> lookupBarcode(String barcode) async {
-    final cleanBarcode = barcode.trim().replaceAll(RegExp(r'\s+'), '');
-    if (cleanBarcode.isEmpty) {
-      return ProductLookupResult(found: false, errorMessage: 'Empty barcode provided');
-    }
+  // Open*Facts asks apps to identify themselves as "AppName/Version (contact)". Browsers do
+  // not allow setting User-Agent, so it is only sent from mobile/desktop.
+  static const _userAgent = 'VanityTracker/1.0 (student project; info@vanitytracker.app)';
 
-    // 0. Check our local curated high-accuracy catalog first for instant response
-    final offlineMatch = _lookupLocalCatalog(cleanBarcode);
-    if (offlineMatch != null) {
+  /// Open*Facts data is under the Open Database License; reusers must attribute it.
+  static const openFactsAttribution =
+      'Product data from Open Beauty Facts / Open Food Facts contributors, available under the '
+      'Open Database License (ODbL): https://world.openbeautyfacts.org';
+
+  /// Cached lookups are reused for this long before asking the database again
+  /// (the Open*Facts APIs allow about 15 product reads per minute).
+  static const cacheTtl = Duration(days: 7);
+  static const _cacheKey = 'product_lookup_cache_v1';
+
+  static Future<Map<String, dynamic>> _readCache() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getString(_cacheKey);
+      if (raw == null) return {};
+      final decoded = jsonDecode(raw);
+      return decoded is Map<String, dynamic> ? decoded : {};
+    } catch (_) {
+      return {}; // a broken cache is ignored, never fatal
+    }
+  }
+
+  static Future<void> _writeCache(String barcode, ProductLookupResult r) async {
+    try {
+      final cache = await _readCache();
+      cache[barcode] = {
+        'saved_at': DateTime.now().toIso8601String(),
+        'source': r.source,
+        'source_url': r.sourceUrl,
+        'attribution': r.attribution,
+        'product': r.product!.toMap(),
+      };
+      // Keep the cache small.
+      if (cache.length > 200) cache.remove(cache.keys.first);
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_cacheKey, jsonEncode(cache));
+    } catch (e) {
+      debugPrint('Lookup cache write failed: $e');
+    }
+  }
+
+  static Future<ProductLookupResult?> _fromCache(String barcode, {required bool allowStale, required bool checkDigitInvalid}) async {
+    final entry = (await _readCache())[barcode];
+    if (entry is! Map) return null;
+    final savedAt = DateTime.tryParse('${entry['saved_at']}');
+    final product = entry['product'];
+    if (savedAt == null || product is! Map) return null;
+    if (!allowStale && DateTime.now().difference(savedAt) > cacheTtl) return null;
+    return ProductLookupResult(
+      found: true,
+      product: ProductModel.fromMap(Map<String, dynamic>.from(product)),
+      source: entry['source'] as String?,
+      sourceUrl: entry['source_url'] as String?,
+      attribution: entry['attribution'] as String?,
+      barcode: barcode,
+      cachedAt: savedAt,
+      checkDigitInvalid: checkDigitInvalid,
+    );
+  }
+
+  /// GET + JSON decode. Throws [_Unreachable] when the server could not be reached or
+  /// did not answer in time; otherwise returns the status code and the JSON object (null
+  /// for a body that is not a JSON object).
+  static Future<_JsonResponse> _getJson(Uri url, Duration timeout, {bool sendUserAgent = true}) async {
+    final http.Response res;
+    try {
+      res = await http
+          .get(url, headers: sendUserAgent && !kIsWeb ? {'User-Agent': _userAgent} : null)
+          .timeout(timeout);
+    } catch (e) {
+      throw _Unreachable(e);
+    }
+    Map<String, dynamic>? json;
+    try {
+      final data = jsonDecode(res.body);
+      if (data is Map<String, dynamic>) json = data;
+    } catch (_) {
+      // not JSON
+    }
+    return (statusCode: res.statusCode, json: json);
+  }
+
+  /// Lookups for the same barcode that are already running (rebuilds, repeated scans and
+  /// double taps share one set of requests).
+  static final Map<String, Future<ProductLookupResult>> _inFlight = {};
+
+  /// Lookup a product by barcode.
+  ///
+  /// 1. The barcode's format is identified and its check digit validated with that
+  ///    format's rule (a UPC-E code is expanded to UPC-A first). A value that is not a
+  ///    barcode, or whose check digit fails, is NOT looked up: a wrong digit would only
+  ///    produce a misleading "not found". [allowInvalidCheckDigit] lets the user search
+  ///    for the number exactly as typed after being told it is probably mistyped.
+  /// 2. Open Beauty Facts, then Open Products Facts and Open Food Facts (and UPCitemdb on
+  ///    mobile/desktop). A record is only accepted when the database says it found it AND
+  ///    the barcode it returns is the one asked for.
+  /// 3. "Not found" is only reported when the databases actually answered "no record";
+  ///    server errors, rate limits, timeouts and no connection are reported as such.
+  ///
+  /// Recent results are cached on the device; [forceRefresh] skips the cache. When no
+  /// database can be reached, a cached result (even an old one, marked with its date) or
+  /// the app's small sample catalog is offered, clearly labelled. Never invents a product.
+  static Future<ProductLookupResult> lookupBarcode(
+    String barcode, {
+    bool forceRefresh = false,
+    bool allowInvalidCheckDigit = false,
+  }) {
+    final key = '${barcode.trim()}|$forceRefresh|$allowInvalidCheckDigit';
+    return _inFlight[key] ??= _lookup(barcode, forceRefresh: forceRefresh, allowInvalidCheckDigit: allowInvalidCheckDigit)
+        .whenComplete(() {
+      _inFlight.remove(key);
+    });
+  }
+
+  static Future<ProductLookupResult> _lookup(
+    String barcode, {
+    required bool forceRefresh,
+    required bool allowInvalidCheckDigit,
+  }) async {
+    if (barcode.trim().isEmpty) {
+      return ProductLookupResult(found: false, status: LookupStatus.invalidFormat, errorMessage: 'Empty barcode provided');
+    }
+    final check = BarcodeUtils.check(barcode);
+    final cleanBarcode = check.lookupDigits;
+    if (cleanBarcode == null) {
+      if (kDebugMode) debugPrint('[lookup] rejected before lookup: not a retail barcode');
       return ProductLookupResult(
-        found: true,
-        product: offlineMatch,
-        source: 'Curated Beauty Intelligence Database',
+        found: false,
+        status: LookupStatus.invalidFormat,
+        errorMessage: '"${barcode.trim()}" is not a product barcode (EAN/UPC: 8, 12, 13 or 14 digits). '
+            'Rescan it, correct the number, or enter the details manually.',
+      );
+    }
+    final checkDigitInvalid = !check.checkDigitValid;
+    if (checkDigitInvalid && !allowInvalidCheckDigit) {
+      if (kDebugMode) debugPrint('[lookup] ${check.formatLabel} check digit failed: not looked up');
+      return ProductLookupResult(
+        found: false,
+        status: LookupStatus.invalidCheckDigit,
+        formatLabel: check.formatLabel,
+        barcode: cleanBarcode,
+        checkDigitInvalid: true,
+        errorMessage: '$cleanBarcode is not a valid ${check.formatLabel} barcode: its check digit does not match, so '
+            'at least one digit was misread or mistyped. Rescan it or compare the number with the pack. '
+            '(The check digit cannot tell which digit is wrong, so the app does not guess.)',
       );
     }
 
-    // 1. Try Open Beauty Facts v2
-    try {
-      final v2Url = Uri.parse('$_beautyFactsV2Url/$cleanBarcode.json');
-      final res = await http.get(v2Url, headers: {
-        'User-Agent': 'VanityTracker - FlutterApp - Version 1.0 (contact: info@vanitytracker.app)',
-      }).timeout(const Duration(seconds: 7));
-
-      if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
-        if (data['status'] == 1 && data['product'] != null) {
-          final product = _parseApiProduct(cleanBarcode, data['product'], 'Open Beauty Facts');
-          return ProductLookupResult(found: true, product: product, source: 'Open Beauty Facts', rawResponse: res.body);
-        }
-      }
-    } catch (e) {
-      debugPrint('Open Beauty Facts v2 error: $e');
+    if (!forceRefresh) {
+      final cached = await _fromCache(cleanBarcode, allowStale: false, checkDigitInvalid: checkDigitInvalid);
+      if (cached != null) return cached;
     }
 
-    // 2. Try Open Beauty Facts v0
-    try {
-      final v0Url = Uri.parse('$_beautyFactsV0Url/$cleanBarcode.json');
-      final res = await http.get(v0Url, headers: {
-        'User-Agent': 'VanityTracker - FlutterApp - Version 1.0',
-      }).timeout(const Duration(seconds: 5));
+    // One request per database (the v2 API answers "not found" with HTTP 404 + status 0,
+    // checked against the live API on 2026-10-19; it also returns 5xx during outages).
+    final sources = <(String, String, Duration)>[
+      ('Open Beauty Facts', _beautyFactsV2Url, const Duration(seconds: 8)),
+      // Cosmetic & personal-care crossover products
+      ('Open Products Facts', _productsFactsV2Url, const Duration(seconds: 5)),
+      ('Open Food Facts', _foodFactsV2Url, const Duration(seconds: 5)),
+    ];
 
-      if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
-        if (data['status'] == 1 && data['product'] != null) {
-          final product = _parseApiProduct(cleanBarcode, data['product'], 'Open Beauty Facts v0');
-          return ProductLookupResult(found: true, product: product, source: 'Open Beauty Facts', rawResponse: res.body);
-        }
-      }
-    } catch (e) {
-      debugPrint('Open Beauty Facts v0 error: $e');
+    final attempts = <LookupAttempt>[];
+    void note(LookupAttempt a) {
+      attempts.add(a);
+      if (kDebugMode) debugPrint('[lookup] $a'); // barcode and source only: no personal data
     }
 
-    // 3. Try Open Food Facts (for cosmetic & personal care crossover products)
-    try {
-      final offUrl = Uri.parse('$_foodFactsV2Url/$cleanBarcode.json');
-      final res = await http.get(offUrl, headers: {
-        'User-Agent': 'VanityTracker - FlutterApp - Version 1.0',
-      }).timeout(const Duration(seconds: 5));
-
-      if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
-        if (data['status'] == 1 && data['product'] != null) {
-          final product = _parseApiProduct(cleanBarcode, data['product'], 'Open Food Facts');
-          return ProductLookupResult(found: true, product: product, source: 'Open Food Facts', rawResponse: res.body);
+    for (final (name, base, timeout) in sources) {
+      try {
+        final res = await _getJson(Uri.parse('$base/$cleanBarcode.json'), timeout);
+        final data = res.json;
+        final product = data?['product'];
+        if (res.statusCode == 200 && data?['status'] == 1 && product is Map<String, dynamic>) {
+          final returned = '${product['code'] ?? data?['code'] ?? ''}';
+          if (returned.isNotEmpty && !BarcodeUtils.sameProduct(returned, cleanBarcode)) {
+            note(LookupAttempt(name, AttemptOutcome.rejected, 'record is for barcode $returned'));
+            continue;
+          }
+          note(LookupAttempt(name, AttemptOutcome.found));
+          final parsed = _parseApiProduct(cleanBarcode, product, name);
+          final result = ProductLookupResult(
+            found: true,
+            attempts: List.unmodifiable(attempts),
+            formatLabel: check.formatLabel,
+            product: parsed,
+            source: name,
+            sourceUrl: parsed.barcodeScanUrl,
+            attribution: openFactsAttribution,
+            barcode: cleanBarcode,
+            checkDigitInvalid: checkDigitInvalid,
+          );
+          await _writeCache(cleanBarcode, result);
+          return result;
         }
+        note(LookupAttempt(name, _outcomeFor(res)));
+      } on _Unreachable catch (e) {
+        note(LookupAttempt(name, e.isTimeout ? AttemptOutcome.timeout : AttemptOutcome.unreachable));
+      } catch (e) {
+        note(LookupAttempt(name, AttemptOutcome.malformed, '$e'));
       }
-    } catch (e) {
-      debugPrint('Open Food Facts lookup error: $e');
     }
 
-    // 4. Try Open Products Facts
-    try {
-      final opfUrl = Uri.parse('$_productsFactsV2Url/$cleanBarcode.json');
-      final res = await http.get(opfUrl, headers: {
-        'User-Agent': 'VanityTracker - FlutterApp - Version 1.0',
-      }).timeout(const Duration(seconds: 5));
-
-      if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
-        if (data['status'] == 1 && data['product'] != null) {
-          final product = _parseApiProduct(cleanBarcode, data['product'], 'Open Products Facts');
-          return ProductLookupResult(found: true, product: product, source: 'Open Products Facts', rawResponse: res.body);
+    // UPCitemdb does not allow browser (CORS) requests, so it only works on mobile/desktop.
+    if (!kIsWeb) {
+      const name = 'UPCitemdb';
+      try {
+        final res = await _getJson(Uri.parse('$_upcItemDbUrl?upc=$cleanBarcode'), const Duration(seconds: 5),
+            sendUserAgent: false);
+        final items = res.json?['items'];
+        if (res.statusCode == 200 && items is List && items.isNotEmpty && items.first is Map<String, dynamic>) {
+          final item = items.first as Map<String, dynamic>;
+          final returned = '${item['ean'] ?? item['upc'] ?? ''}';
+          if (returned.isNotEmpty && !BarcodeUtils.sameProduct(returned, cleanBarcode)) {
+            note(LookupAttempt(name, AttemptOutcome.rejected, 'record is for barcode $returned'));
+          } else {
+            note(LookupAttempt(name, AttemptOutcome.found));
+            return ProductLookupResult(
+              found: true,
+              attempts: List.unmodifiable(attempts),
+              formatLabel: check.formatLabel,
+              product: _parseUpcDbProduct(cleanBarcode, item),
+              source: 'UPC Database',
+              barcode: cleanBarcode,
+              checkDigitInvalid: checkDigitInvalid,
+            );
+          }
+        } else {
+          // UPCitemdb answers an unknown code with 200 and no items.
+          note(LookupAttempt(name, res.statusCode == 200 && items is List ? AttemptOutcome.notFound : _outcomeFor(res)));
         }
+      } on _Unreachable catch (e) {
+        note(LookupAttempt(name, e.isTimeout ? AttemptOutcome.timeout : AttemptOutcome.unreachable));
+      } catch (e) {
+        note(LookupAttempt(name, AttemptOutcome.malformed, '$e'));
       }
-    } catch (e) {
-      debugPrint('Open Products Facts lookup error: $e');
     }
 
-    // 5. Try UPCitemdb Public Lookup
-    try {
-      final upcUrl = Uri.parse('$_upcItemDbUrl?upc=$cleanBarcode');
-      final res = await http.get(upcUrl).timeout(const Duration(seconds: 5));
-      if (res.statusCode == 200) {
-        final data = jsonDecode(res.body);
-        if (data['items'] != null && (data['items'] as List).isNotEmpty) {
-          final item = data['items'][0];
-          final product = _parseUpcDbProduct(cleanBarcode, item);
-          return ProductLookupResult(found: true, product: product, source: 'UPC Database', rawResponse: res.body);
+    final answered = attempts.where((a) => a.outcome != AttemptOutcome.timeout && a.outcome != AttemptOutcome.unreachable);
+    if (answered.isEmpty) {
+      // Offline: an earlier lookup of this barcode, however old, is better than nothing,
+      // as long as its date is shown. Then the small sample catalog, clearly labelled.
+      final stale = await _fromCache(cleanBarcode, allowStale: true, checkDigitInvalid: checkDigitInvalid);
+      if (stale != null) return stale;
+      for (final candidate in BarcodeUtils.equivalents(cleanBarcode)) {
+        final offlineMatch = _lookupLocalCatalog(candidate);
+        if (offlineMatch != null) {
+          return ProductLookupResult(
+            found: true,
+            attempts: List.unmodifiable(attempts),
+            formatLabel: check.formatLabel,
+            product: offlineMatch,
+            source: 'Offline sample catalog (unverified)',
+            barcode: cleanBarcode,
+            checkDigitInvalid: checkDigitInvalid,
+            errorMessage: 'Could not reach the product databases. Showing an entry from the app\'s offline sample '
+                'catalog: check that the name matches your product.',
+          );
         }
       }
-    } catch (e) {
-      debugPrint('UPCitemdb lookup error: $e');
-    }
-
-    // 6. Barcode Country & Brand Prefix Inference (Heuristic fallback)
-    final inferred = _inferFromBarcodePrefix(cleanBarcode);
-    if (inferred != null) {
+      final allTimedOut = attempts.isNotEmpty && attempts.every((a) => a.outcome == AttemptOutcome.timeout);
       return ProductLookupResult(
-        found: true,
-        product: inferred,
-        source: 'Smart Barcode Prefix Heuristic',
+        found: false,
+        status: allTimedOut ? LookupStatus.timeout : LookupStatus.offline,
+        attempts: List.unmodifiable(attempts),
+        formatLabel: check.formatLabel,
+        barcode: cleanBarcode,
+        networkError: true,
+        checkDigitInvalid: checkDigitInvalid,
+        errorMessage: allTimedOut
+            ? 'The product databases did not answer in time. Try again, or enter the details manually.'
+            : 'Could not reach the product databases (check your internet connection). '
+                'Try again, or enter the details manually.',
       );
     }
 
+    // Only a definite "no record" from every database counts as not found.
+    if (attempts.any((a) => a.outcome != AttemptOutcome.notFound && a.outcome != AttemptOutcome.rejected)) {
+      return ProductLookupResult(
+        found: false,
+        status: LookupStatus.unavailable,
+        attempts: List.unmodifiable(attempts),
+        formatLabel: check.formatLabel,
+        barcode: cleanBarcode,
+        checkDigitInvalid: checkDigitInvalid,
+        errorMessage: 'No product record was found for $cleanBarcode, but some databases could not be checked '
+            '(${attempts.where((a) => a.outcome != AttemptOutcome.notFound).map((a) => '${a.source}: ${_outcomeText(a.outcome)}').join('; ')}). '
+            'Try again later, search by name, or enter the details manually.',
+      );
+    }
+
+    // A GS1 prefix only tells where the barcode was registered, not the brand or origin,
+    // so it is offered as a hint, never as product data.
+    final region = _getCountryFromBarcodePrefix(cleanBarcode);
     return ProductLookupResult(
       found: false,
-      errorMessage: 'Product barcode not found online. You can enter details manually.',
+      status: LookupStatus.notFound,
+      attempts: List.unmodifiable(attempts),
+      formatLabel: check.formatLabel,
+      barcode: cleanBarcode,
+      checkDigitInvalid: checkDigitInvalid,
+      errorMessage: checkDigitInvalid
+          ? 'No product found for $cleanBarcode (searched exactly as entered, although its check digit is invalid).'
+          : 'Barcode $cleanBarcode is valid, but no product record was found in the available databases '
+              '(cosmetics coverage is incomplete). Search by name, or enter the details manually.'
+              '${region != null ? ' (Barcode registered in $region.)' : ''}',
     );
+  }
+
+  static AttemptOutcome _outcomeFor(_JsonResponse res) {
+    if (res.statusCode == 429) return AttemptOutcome.rateLimited;
+    if (res.statusCode >= 500) return AttemptOutcome.serverError;
+    if (res.json == null) return AttemptOutcome.malformed;
+    // Open*Facts: "not found" is status 0 (HTTP 404, or 200 on older API versions).
+    if (res.json!['status'] == 0 || res.statusCode == 404) return AttemptOutcome.notFound;
+    return AttemptOutcome.malformed;
+  }
+
+  static String _outcomeText(AttemptOutcome o) => switch (o) {
+        AttemptOutcome.serverError => 'server error',
+        AttemptOutcome.rateLimited => 'too many requests',
+        AttemptOutcome.timeout => 'timed out',
+        AttemptOutcome.unreachable => 'not reachable',
+        AttemptOutcome.malformed => 'unreadable answer',
+        AttemptOutcome.rejected => 'record for a different barcode',
+        AttemptOutcome.notFound => 'not found',
+        AttemptOutcome.found => 'found',
+      };
+
+  static const _searchUrl = 'https://world.openbeautyfacts.org/cgi/search.pl';
+
+  /// Searches Open Beauty Facts by product name and/or brand (user-triggered only; the
+  /// service allows about 10 searches per minute). Results without a barcode or name are
+  /// dropped. Returns candidates for the user to choose from: nothing is auto-selected.
+  static Future<ProductSearchResult> searchByName(String query) async {
+    final q = query.trim();
+    if (q.length < 3) return const ProductSearchResult([], 'Type at least 3 letters of the name or brand.');
+    final uri = Uri.parse(_searchUrl).replace(queryParameters: {
+      'search_terms': q,
+      'search_simple': '1',
+      'action': 'process',
+      'json': '1',
+      'page_size': '15',
+      'fields': 'code,product_name,brands,quantity,image_front_small_url',
+    });
+    try {
+      final res = await _getJson(uri, const Duration(seconds: 12));
+      if (res.statusCode != 200 || res.json == null) {
+        return ProductSearchResult(const [], 'The search did not work (${_outcomeText(_outcomeFor(res))}). Try again later.');
+      }
+      final products = res.json!['products'];
+      if (products is! List) return const ProductSearchResult([], 'The search returned an unreadable answer.');
+      final out = <ProductSearchCandidate>[];
+      final seen = <String>{};
+      for (final p in products.whereType<Map>()) {
+        final code = BarcodeUtils.normalize('${p['code'] ?? ''}');
+        final name = _text([p['product_name']]);
+        if (code == null || name == null || !seen.add(code)) continue;
+        out.add(ProductSearchCandidate(
+          barcode: code,
+          name: name,
+          brand: _text([p['brands']]) ?? '',
+          quantity: _text([p['quantity']]),
+          imageUrl: _text([p['image_front_small_url']]),
+        ));
+      }
+      return ProductSearchResult(out, out.isEmpty ? 'No products matched "$q".' : null);
+    } on _Unreachable catch (e) {
+      return ProductSearchResult(
+        const [],
+        e.isTimeout ? 'The search did not answer in time. Try again.' : 'Could not reach Open Beauty Facts (offline?).',
+      );
+    }
+  }
+
+  /// First non-empty trimmed string among [values] (ignores non-strings and blanks).
+  static String? _text(Iterable<dynamic> values) {
+    for (final v in values) {
+      if (v is String && v.trim().isNotEmpty) return v.trim();
+    }
+    return null;
   }
 
   /// Parses Open Beauty/Food Facts comprehensive JSON
   static ProductModel _parseApiProduct(String barcode, Map<String, dynamic> p, String sourceDb) {
-    // 1. Name
-    final name = (p['product_name'] as String?)?.trim() ??
-        (p['product_name_en'] as String?)?.trim() ??
-        (p['generic_name'] as String?)?.trim() ??
-        (p['product_name_fr'] as String?)?.trim() ??
-        'Cosmetic Product';
+    // 1. Name (empty strings are common in these databases; fall through to the next field).
+    // Left empty when the record has no name, so the user fills it in instead of saving a placeholder.
+    final name = _text([p['product_name'], p['product_name_en'], p['generic_name'], p['product_name_fr']]) ?? '';
 
     // 2. Brand
-    final brand = (p['brands'] as String?)?.trim() ??
-        (p['brand_owner'] as String?)?.trim() ??
-        (p['brands_tags'] != null && (p['brands_tags'] as List).isNotEmpty
-            ? (p['brands_tags'] as List).first.toString().replaceAll('en:', '').replaceAll('-', ' ')
-            : 'Unknown Brand');
+    final brandTags = p['brands_tags'];
+    final brand = _text([
+          p['brands'],
+          p['brand_owner'],
+          if (brandTags is List && brandTags.isNotEmpty)
+            brandTags.first.toString().replaceAll('en:', '').replaceAll('-', ' '),
+        ]) ??
+        '';
 
     // 3. Images
     final imageUrl = p['image_front_url'] as String? ??
@@ -194,19 +567,41 @@ class ProductLookupService {
     final volume = (p['quantity'] as String?)?.trim() ??
         (p['product_quantity'] != null ? '${p['product_quantity']} ${p['product_quantity_unit'] ?? ''}'.trim() : null);
 
-    // 5. Ingredients & INCI
-    final ingredients = (p['ingredients_text'] as String?)?.trim() ??
-        (p['ingredients_text_en'] as String?)?.trim() ??
-        (p['ingredients_text_with_allergens'] as String?)?.trim();
-    final inci = (p['ingredients_text_en'] as String?)?.trim() ??
-        (p['ingredients'] as List<dynamic>?)?.map((i) => i['text']?.toString() ?? '').where((s) => s.isNotEmpty).join(', ');
+    // 5. Ingredients: the record's own list, in the record's language. Empty strings are
+    // common and mean "no list".
+    final ingredients = _text([p['ingredients_text'], p['ingredients_text_en']]);
+    final inci = _text([p['ingredients_text_en']]);
+    final soldIn = (p['countries_tags'] is List)
+        ? (p['countries_tags'] as List)
+            .map((c) => c.toString().replaceFirst(RegExp(r'^[a-z]{2}:'), '').replaceAll('-', ' '))
+            .where((c) => c.isNotEmpty)
+            .join(', ')
+        : '';
+    final lastModified = p['last_modified_t'] is num
+        ? DateTime.fromMillisecondsSinceEpoch((p['last_modified_t'] as num).toInt() * 1000)
+        : null;
+    final ingredientsContext = ingredients == null
+        ? null
+        : [
+            '$sourceDb record $barcode',
+            if (soldIn.isNotEmpty) 'sold in: $soldIn',
+            if (lastModified != null) 'record updated ${lastModified.toIso8601String().split('T').first}',
+          ].join('; ');
 
-    // 6. Category & PAO
-    final detectedCategory = _detectCategory(p);
-    final paoMonths = _extractPao(p, defaultPao: detectedCategory.defaultPaoMonths);
+    // 6. Category & PAO (only a PAO the record explicitly lists counts as product data)
+    final categorySuggestion = detectCategory(p);
+    final detectedCategory = _findCategory(categorySuggestion?.categoryId ?? 'other');
+    final explicitPao = _extractPao(p);
+    final paoMonths = explicitPao ?? detectedCategory.defaultPaoMonths;
+    // A category default is only an estimate, and without an identified category there is
+    // nothing to base one on: PAO stays unknown until the user sets it.
+    final paoSource = explicitPao != null
+        ? PaoSource.productDatabase
+        : (categorySuggestion != null ? PaoSource.categoryDefault : PaoSource.unknown);
 
-    // 7. Country of Origin
-    final country = _extractCountry(p, barcode);
+    // 7. Country of origin: only where the record states origin or place of manufacture
+    // ("countries" in these databases means where the product is sold).
+    final country = _extractCountry(p);
 
     // 8. Packaging type
     final packaging = _extractPackaging(p);
@@ -248,9 +643,13 @@ class ProductLookupService {
     // 20. Product code / SKU
     final productCode = p['code'] as String? ?? p['_id'] as String?;
 
-    // 21. Product page URL
-    final barcodeScanUrl = p['url'] as String? ??
-        'https://world.openbeautyfacts.org/product/$barcode';
+    // 21. Product page URL on the database the record came from
+    final host = switch (sourceDb) {
+      'Open Food Facts' => 'world.openfoodfacts.org',
+      'Open Products Facts' => 'world.openproductsfacts.org',
+      _ => 'world.openbeautyfacts.org',
+    };
+    final barcodeScanUrl = _text([p['url']]) ?? 'https://$host/product/$barcode';
 
     return ProductModel(
       productId: 'prod_${DateTime.now().millisecondsSinceEpoch}_$barcode',
@@ -258,11 +657,16 @@ class ProductLookupService {
       name: name,
       brand: brand,
       categoryId: detectedCategory.categoryId,
+      categorySource: categorySuggestion?.source ?? CategorySource.unknown,
       paoMonths: paoMonths,
+      paoSource: paoSource,
       imageUrl: imageUrl,
       thumbnailUrl: thumbnailUrl,
       volume: volume,
       ingredients: ingredients,
+      ingredientsSource: ingredients != null ? IngredientSource.productDatabase : IngredientSource.notRecorded,
+      ingredientsUpdatedAt: ingredients != null ? DateTime.now() : null,
+      ingredientsContext: ingredientsContext,
       countryOfOrigin: country,
       packagingType: packaging,
       skinClaims: claims,
@@ -289,13 +693,14 @@ class ProductLookupService {
 
   /// Parses UPC Item DB API
   static ProductModel _parseUpcDbProduct(String barcode, Map<String, dynamic> item) {
-    final title = (item['title'] as String?)?.trim() ?? 'Cosmetic Product';
-    final brand = (item['brand'] as String?)?.trim() ?? 'Unknown Brand';
+    final title = _text([item['title']]) ?? '';
+    final brand = _text([item['brand']]) ?? '';
     final category = (item['category'] as String?) ?? '';
     final images = item['images'] as List?;
     final imageUrl = images != null && images.isNotEmpty ? images[0] as String? : null;
 
-    final detectedCat = _detectCategoryFromText('$title $category');
+    final suggestion = CategoryClassifier.fromDatabaseCategories(category.split('>')) ?? CategoryClassifier.fromName(title);
+    final detectedCat = _findCategory(suggestion?.categoryId ?? 'other');
     final claims = _extractClaimsFromText(title);
     final keyActives = _extractKeyActives(item['description'] as String?, title);
 
@@ -305,10 +710,11 @@ class ProductLookupService {
       name: title,
       brand: brand,
       categoryId: detectedCat.categoryId,
+      categorySource: suggestion?.source ?? CategorySource.unknown,
       paoMonths: detectedCat.defaultPaoMonths,
+      paoSource: suggestion != null ? PaoSource.categoryDefault : PaoSource.unknown,
       imageUrl: imageUrl,
       volume: item['size'] as String?,
-      countryOfOrigin: _getCountryFromBarcodePrefix(barcode),
       skinClaims: claims,
       keyActives: keyActives,
       sourceDatabase: 'UPC Database',
@@ -318,88 +724,57 @@ class ProductLookupService {
 
   // ===================== INTELLIGENT METADATA EXTRACTORS =====================
 
-  static CategoryModel _detectCategory(Map<String, dynamic> p) {
-    final categoriesStr = [
-      p['categories'] ?? '',
-      p['categories_tags'] != null ? (p['categories_tags'] as List).join(' ') : '',
-      p['categories_hierarchy'] != null ? (p['categories_hierarchy'] as List).join(' ') : '',
-      p['product_name'] ?? '',
-      p['generic_name'] ?? '',
-    ].join(' ').toLowerCase();
-
-    return _detectCategoryFromText(categoriesStr);
+  /// The record's own categories first (most specific tag first), then its name; null
+  /// when neither identifies a category.
+  static CategorySuggestion? detectCategory(Map<String, dynamic> p) {
+    List<String> strings(Object? raw) => raw is List ? raw.map((e) => e.toString()).toList() : const [];
+    final hierarchy = strings(p['categories_hierarchy']);
+    final tags = hierarchy.isNotEmpty ? hierarchy : strings(p['categories_tags']);
+    final free = (p['categories'] as String? ?? '').split(',');
+    return CategoryClassifier.fromDatabaseCategories([...free, ...tags]) ??
+        CategoryClassifier.fromName('${p['product_name'] ?? ''} ${p['generic_name'] ?? ''}');
   }
 
-  static CategoryModel _detectCategoryFromText(String text) {
-    final lower = text.toLowerCase();
+  static CategoryModel _findCategory(String id) => CategoryModel.byId(id) ?? CategoryModel.defaultCategories.last;
 
-    if (lower.contains('serum') || lower.contains('ampoule') || lower.contains('essence') || lower.contains('booster') || lower.contains('concentrate')) {
-      return _findCategory('serum');
-    }
-    if (lower.contains('sunscreen') || lower.contains('spf') || lower.contains('sun protection') || lower.contains('solaire') || lower.contains('sun cream') || lower.contains('sun milk')) {
-      return _findCategory('sunscreen');
-    }
-    if (lower.contains('mascara') || lower.contains('lash') || lower.contains('eyelash')) {
-      return _findCategory('mascara');
-    }
-    if (lower.contains('foundation') || lower.contains('bb cream') || lower.contains('cc cream') || lower.contains('concealer') || lower.contains('cushion') || lower.contains('skin tint')) {
-      return _findCategory('foundation');
-    }
-    if (lower.contains('lipstick') || lower.contains('lip gloss') || lower.contains('lip balm') || lower.contains('lip tint') || lower.contains('lip oil') || lower.contains('lip mask')) {
-      return _findCategory('lipstick');
-    }
-    if (lower.contains('eye cream') || lower.contains('eye contour') || lower.contains('eye gel') || lower.contains('contour des yeux')) {
-      return _findCategory('eye_cream');
-    }
-    if (lower.contains('moisturizer') || lower.contains('moisturiser') || lower.contains('cream') || lower.contains('lotion') || lower.contains('hydratant') || lower.contains('emulsion') || lower.contains('balm')) {
-      return _findCategory('moisturizer');
-    }
-    if (lower.contains('cleanser') || lower.contains('face wash') || lower.contains('micellar') || lower.contains('nettoyant') || lower.contains('cleansing foam') || lower.contains('cleansing oil')) {
-      return _findCategory('cleanser');
-    }
-    if (lower.contains('toner') || lower.contains('astringent') || lower.contains('skin refiner') || lower.contains('facial mist') || lower.contains('clarifying lotion')) {
-      return _findCategory('toner');
-    }
-    if (lower.contains('perfume') || lower.contains('fragrance') || lower.contains('eau de parfum') || lower.contains('eau de toilette') || lower.contains('cologne')) {
-      return _findCategory('fragrance');
+  /// The PAO the database explicitly lists for this product, or null when it lists none.
+  ///
+  /// Open Beauty Facts stores it as `periods_after_opening_tags` (e.g. "en:12-months") and
+  /// the free-text `periods_after_opening` (e.g. "12 M", "12 mois"); these field names were
+  /// checked against live API responses. The app previously read `period_after_opening`,
+  /// which does not exist, so every lookup fell back to the category default.
+  static int? extractPao(Map<String, dynamic> p) {
+    int? valid(String? digits) {
+      final n = int.tryParse(digits ?? '');
+      return n != null && n >= ProductModel.minPaoMonths && n <= ProductModel.maxPaoMonths ? n : null;
     }
 
-    return _findCategory('other');
-  }
-
-  static CategoryModel _findCategory(String id) {
-    return CategoryModel.defaultCategories.firstWhere(
-      (c) => c.categoryId == id,
-      orElse: () => CategoryModel.defaultCategories.last,
-    );
-  }
-
-  static int _extractPao(Map<String, dynamic> p, {required int defaultPao}) {
-    final rawPao = p['period_after_opening'] as String? ??
-        p['pao'] as String? ??
-        p['period_after_opening_en'] as String?;
-
-    if (rawPao != null) {
-      final match = RegExp(r'(\d+)\s*m', caseSensitive: false).firstMatch(rawPao);
-      if (match != null) {
-        final parsed = int.tryParse(match.group(1)!);
-        if (parsed != null && parsed > 0 && parsed <= 60) {
-          return parsed;
-        }
+    final tags = p['periods_after_opening_tags'];
+    if (tags is List) {
+      for (final t in tags) {
+        final m = RegExp(r'(\d+)-months?$').firstMatch(t.toString());
+        final n = valid(m?.group(1));
+        if (n != null) return n;
       }
     }
-    return defaultPao;
+    final text = _text([p['periods_after_opening'], p['period_after_opening']]);
+    if (text != null) {
+      final m = RegExp(r'(\d+)\s*(m\b|mois|months?|monate|meses|mesi)', caseSensitive: false).firstMatch(text);
+      return valid(m?.group(1));
+    }
+    return null;
   }
 
-  static String? _extractCountry(Map<String, dynamic> p, String barcode) {
-    final origin = p['origins'] as String? ??
-        p['countries'] as String? ??
-        p['manufacturing_places'] as String?;
+  static int? _extractPao(Map<String, dynamic> p) => extractPao(p);
 
-    if (origin != null && origin.isNotEmpty) {
-      return origin.split(',').first.trim().replaceAll('en:', '');
+  static String? _extractCountry(Map<String, dynamic> p) {
+    final origin = _text([p['origins'], p['manufacturing_places']]);
+    if (origin != null) {
+      return origin.split(',').first.trim().replaceFirst(RegExp(r'^[a-z]{2}:'), '');
     }
-    return _getCountryFromBarcodePrefix(barcode);
+    // No barcode-prefix guess: a GS1 prefix shows where the barcode was registered,
+    // not where the product was made.
+    return null;
   }
 
   static String? _getCountryFromBarcodePrefix(String barcode) {
@@ -501,10 +876,13 @@ class ProductLookupService {
     if (text.contains('niacinamide')) actives.add('Niacinamide (Vitamin B3)');
     if (text.contains('ceramide') || text.contains('ceramides')) actives.add('Ceramides NP/AP/EOP');
     if (text.contains('centella asiatica') || text.contains('madecassoside') || text.contains('cica')) actives.add('Centella Asiatica (Cica)');
-    if (text.contains('salicylic acid') || text.contains('bha')) actives.add('Salicylic Acid (BHA)');
-    if (text.contains('glycolic acid') || text.contains('lactic acid') || text.contains('aha')) actives.add('AHA (Glycolic / Lactic Acid)');
+    if (text.contains('salicylic acid') || RegExp(r'\bbha\b').hasMatch(text)) actives.add('Salicylic Acid (BHA)');
+    if (text.contains('glycolic acid') || text.contains('lactic acid') || RegExp(r'\baha\b').hasMatch(text)) {
+      actives.add('AHA (Glycolic / Lactic Acid)');
+    }
     if (text.contains('ascorbic acid') || text.contains('vitamin c')) actives.add('Vitamin C');
-    if (text.contains('retinol') || text.contains('retinal') || text.contains('bakuchiol')) actives.add('Retinol / Retinal');
+    if (text.contains('retinol') || RegExp(r'\bretinal\b').hasMatch(text)) actives.add('Retinol / Retinal');
+    if (text.contains('bakuchiol')) actives.add('Bakuchiol');
     if (text.contains('snail secretion') || text.contains('snail mucin')) actives.add('Snail Secretion Filtrate');
     if (text.contains('panthenol') || text.contains('vitamin b5')) actives.add('Panthenol (Pro-Vitamin B5)');
     if (text.contains('zinc pca') || text.contains('zinc oxide')) actives.add('Zinc');
@@ -661,7 +1039,8 @@ class ProductLookupService {
     if (combined.contains('body') || combined.contains('hands') || combined.contains('foot')) return 'Body';
     if (combined.contains('hair') || combined.contains('scalp')) return 'Hair & Scalp';
     if (combined.contains('neck') || combined.contains('décolleté') || combined.contains('decollete')) return 'Face, Neck & Décolleté';
-    return 'Face'; // Default for most cosmetics
+    if (combined.contains('face') || combined.contains('facial') || combined.contains('visage')) return 'Face';
+    return null; // not stated: left empty rather than assumed
   }
 
   static String? _extractTexture(Map<String, dynamic> p, String name, String categoryId) {
@@ -702,71 +1081,42 @@ class ProductLookupService {
     if (combined.contains('musk')) return 'Musky';
     if (combined.contains('berry') || combined.contains('fruit')) return 'Fruity / Berry';
     if (combined.contains('fresh') || combined.contains('aqua')) return 'Fresh / Aquatic';
-
-    // Check if fragrance free from ingredients
-    if (ingredients != null && !ingredients.toLowerCase().contains('parfum') &&
-        !ingredients.toLowerCase().contains('fragrance')) {
-      return 'Fragrance-Free';
-    }
+    // Not inferred from an ingredient list without "parfum": that is not a fragrance-free claim.
     return null;
   }
 
+  /// Only a pH the record states; never guessed from the product name.
   static String? _extractPH(Map<String, dynamic> p) {
-    final phRaw = p['ph'] as String? ?? p['pH'] as String?;
-    if (phRaw != null && phRaw.isNotEmpty) return 'pH $phRaw';
-
-    // Infer likely pH range from category/name
-    final name = (p['product_name'] ?? p['generic_name'] ?? '').toString().toLowerCase();
-    if (name.contains('aha') || name.contains('bha') || name.contains('peeling') || name.contains('exfoliant')) {
-      return '~pH 3.5–4.0 (Acid Exfoliant)';
-    }
-    if (name.contains('toner') || name.contains('astringent')) return '~pH 5.0–6.0';
-    if (name.contains('cleanser') || name.contains('face wash')) return '~pH 5.5–6.5';
-    if (name.contains('vitamin c') || name.contains('ascorbic acid')) return '~pH 2.5–3.5 (Vitamin C)';
-    return null;
+    final phRaw = _text([p['ph'], p['pH']]);
+    return phRaw != null ? 'pH $phRaw' : null;
   }
 
   // ===================== CURATED BEAUTY INTELLIGENCE LOCAL CATALOG =====================
 
 
+  /// Offline fallback only. Entries were written into the app and are not verified: a
+  /// barcode whose check digit is invalid cannot be a real product, and one entry
+  /// (3337875597180) was shown by Open Beauty Facts to belong to a different product, so
+  /// it was removed. PAO and ingredients are labelled as catalog data.
   static ProductModel? _lookupLocalCatalog(String barcode) {
-    final catalog = _curatedBeautyCatalog;
-    return catalog[barcode];
-  }
-
-  static ProductModel? _inferFromBarcodePrefix(String barcode) {
-    final country = _getCountryFromBarcodePrefix(barcode);
-    if (country == null) return null;
-
-    return ProductModel(
-      productId: 'inferred_${DateTime.now().millisecondsSinceEpoch}',
-      barcode: barcode,
-      name: 'Cosmetic Product ($country)',
-      brand: 'Product of $country',
-      categoryId: 'other',
-      paoMonths: 12,
-      countryOfOrigin: country,
-      sourceDatabase: 'Barcode Region Intelligence',
-      createdAt: DateTime.now(),
+    if (!BarcodeUtils.hasValidCheckDigit(barcode)) return null;
+    final entry = _curatedBeautyCatalog[barcode];
+    if (entry == null) return null;
+    return entry.copyWith(
+      paoSource: PaoSource.appCatalog,
+      ingredientsSource: entry.ingredients != null ? IngredientSource.appCatalog : null,
     );
   }
 
+  // Offline fallback only (labelled unverified). Nine entries were removed on 2026-10-19
+  // because their barcodes had impossible GS1 check digits (e.g. 8809643068098), so they
+  // could not belong to any real product; every remaining key passes validation (tested).
+  @visibleForTesting
+  static Iterable<String> get catalogBarcodes => _curatedBeautyCatalog.keys;
+
   static final Map<String, ProductModel> _curatedBeautyCatalog = {
-    // La Roche-Posay
-    '3337875597180': const ProductModel(
-      productId: 'curated_lrp_hyalu',
-      barcode: '3337875597180',
-      name: 'Hyalu B5 Pure Hyaluronic Acid Serum',
-      brand: 'La Roche-Posay',
-      categoryId: 'serum',
-      paoMonths: 12,
-      volume: '30 ml',
-      countryOfOrigin: 'France',
-      packagingType: 'Dropper Pipette',
-      skinClaims: ['Deep Hydration', 'Dermatologist Tested', 'For Sensitive Skin'],
-      keyActives: 'Hyaluronic Acid • Panthenol (Pro-Vitamin B5) • Madecassoside',
-      ingredients: 'Aqua / Water, Glycerin, Alcohol Denat., Propylene Glycol, Panthenol, Pentylene Glycol, Dimethicone, PEG-6 Caprylic/Capric Glycerides, PPG-6-Decyltetradeceth-30, Glyceryl Isostearate, Madecassoside, Sodium Hyaluronate, Ammonium Polyacryloyldimethyl Taurate, Disodium EDTA, Hydrolyzed Hyaluronic Acid, Caprylyl Glycol, Citric Acid, Xanthan Gum, Butylene Glycol, Tocopherol, Phenoxyethanol, Parfum / Fragrance.',
-    ),
+    // La Roche-Posay ("3337875597180" removed: Open Beauty Facts lists that barcode as
+    // CeraVe Hydrating Cleanser, not Hyalu B5.)
     '3337875545778': const ProductModel(
       productId: 'curated_lrp_anthelios',
       barcode: '3337875545778',
@@ -780,64 +1130,6 @@ class ProductLookupService {
       skinClaims: ['SPF Protection', 'Fragrance-Free', 'Non-Comedogenic'],
       keyActives: 'Mexoryl 400 • Netlock Technology • Vitamin E',
       ingredients: 'Aqua / Water, Alcohol Denat., Triethyl Citrate, Diisopropyl Sebacate, Silica, Ethylhexyl Salicylate, Bis-Ethylhexyloxyphenol Methoxyphenyl Triazine, Ethylhexyl Triazone, Butyl Methoxydibenzoylmethane, Glycerin, Propanediol, C12-22 Alkyl Acrylate/Hydroxyethylacrylate Copolymer, Methoxypropylamino Cyclohexenylidene Ethoxyethylcyanoacetate, Perlite, Drometrizole Trisiloxane, Caprylic/Capric Triglyceride, Tocopherol...',
-    ),
-    '3337872412995': const ProductModel(
-      productId: 'curated_lrp_cicaplast',
-      barcode: '3337872412995',
-      name: 'Cicaplast Baume B5+ Ultra-Repairing Soothing Balm',
-      brand: 'La Roche-Posay',
-      categoryId: 'moisturizer',
-      paoMonths: 6,
-      volume: '100 ml',
-      countryOfOrigin: 'France',
-      packagingType: 'Squeeze Tube',
-      skinClaims: ['Fragrance-Free', 'For Sensitive Skin', 'Deep Hydration'],
-      keyActives: 'Panthenol (Pro-Vitamin B5) • Madecassoside • Zinc',
-    ),
-
-    // Beauty of Joseon
-    '8809643068098': const ProductModel(
-      productId: 'curated_boj_relief_sun',
-      barcode: '8809643068098',
-      name: 'Relief Sun : Rice + Probiotics (SPF50+ PA++++)',
-      brand: 'Beauty of Joseon',
-      categoryId: 'sunscreen',
-      paoMonths: 12,
-      volume: '50 ml',
-      countryOfOrigin: 'South Korea',
-      packagingType: 'Squeeze Tube',
-      skinClaims: ['SPF Protection', 'Fragrance-Free', 'Cruelty-Free / Vegan', 'Deep Hydration'],
-      keyActives: 'Oryza Sativa (Rice) Extract (30%) • Grain Probiotics Complex • Niacinamide (Vitamin B3)',
-      ingredients: 'Water, Oryza Sativa (Rice) Extract (30%), Dibutyl Adipate, Propanediol, Diethylamino Hydroxybenzoyl Hexyl Benzoate, Polymethylsilsesquioxane, Ethylhexyl Triazone, Niacinamide, Methylene Bis-benzotriazolyl Tetramethylbutylphenol, Coco-caprylate/Caprate, Caprylyl Methicone, Diethylhexyl Butamido Triazone, Glycerin, Butylene Glycol, Oryza Sativa (Rice) Germ Extract, Camellia Sinensis Leaf Extract, Lactobacillus/Rice Ferment, Aspergillus Ferment, Saccharomyces/Rice Ferment Filtrate, Panax Ginseng Root Extract...',
-    ),
-    '8809643068104': const ProductModel(
-      productId: 'curated_boj_glow_serum',
-      barcode: '8809643068104',
-      name: 'Glow Serum : Propolis + Niacinamide',
-      brand: 'Beauty of Joseon',
-      categoryId: 'serum',
-      paoMonths: 12,
-      volume: '30 ml',
-      countryOfOrigin: 'South Korea',
-      packagingType: 'Dropper Pipette',
-      skinClaims: ['Deep Hydration', 'Cruelty-Free / Vegan', 'Fragrance-Free'],
-      keyActives: 'Propolis Extract (60%) • Niacinamide (Vitamin B3) (2%) • BHA',
-    ),
-
-    // CeraVe
-    '3337872412483': const ProductModel(
-      productId: 'curated_cerave_moisturizing_cream',
-      barcode: '3337872412483',
-      name: 'Moisturizing Cream with Essential Ceramides',
-      brand: 'CeraVe',
-      categoryId: 'moisturizer',
-      paoMonths: 12,
-      volume: '454 g',
-      countryOfOrigin: 'United States / Canada',
-      packagingType: 'Jar / Tub',
-      skinClaims: ['Fragrance-Free', 'Non-Comedogenic', 'Deep Hydration', 'Dermatologist Tested'],
-      keyActives: 'Ceramides NP/AP/EOP • Hyaluronic Acid • MVE Technology',
-      ingredients: 'Aqua / Water / Eau, Glycerin, Cetearyl Alcohol, Caprylic/Capric Triglyceride, Cetyl Alcohol, Ceteareth-20, Petrolatum, Potassium Phosphate, Ceramide NP, Ceramide AP, Ceramide EOP, Carbomer, Dimethicone, Behentrimonium Methosulfate, Sodium Lauroyl Lactylate, Sodium Hyaluronate, Cholesterol, Phenoxyethanol, Disodium EDTA, Dipotassium Phosphate, Tocopherol, Phytosphingosine, Xanthan Gum, Ethylhexylglycerin.',
     ),
     '3337875597388': const ProductModel(
       productId: 'curated_cerave_hydrating_cleanser',
@@ -925,21 +1217,6 @@ class ProductLookupService {
     ),
 
     // Paula's Choice
-    '0655439020108': const ProductModel(
-      productId: 'curated_paulas_choice_bha',
-      barcode: '0655439020108',
-      name: 'Skin Perfecting 2% BHA Liquid Exfoliant',
-      brand: "Paula's Choice",
-      categoryId: 'toner',
-      paoMonths: 12,
-      volume: '118 ml',
-      countryOfOrigin: 'United States / Canada',
-      packagingType: 'Bottle',
-      skinClaims: ['Fragrance-Free', 'Cruelty-Free / Vegan', 'Non-Comedogenic'],
-      keyActives: 'Salicylic Acid (BHA) (2%) • Green Tea Extract • Methylpropanediol',
-    ),
-
-    // Maybelline
     '041554420616': const ProductModel(
       productId: 'curated_maybelline_sky_high',
       barcode: '041554420616',
@@ -967,21 +1244,6 @@ class ProductLookupService {
     ),
 
     // Laneige
-    '8809643053674': const ProductModel(
-      productId: 'curated_laneige_lip_sleeping_mask',
-      barcode: '8809643053674',
-      name: 'Lip Sleeping Mask Intense Hydration with Vitamin C (Berry)',
-      brand: 'Laneige',
-      categoryId: 'lipstick',
-      paoMonths: 12,
-      volume: '20 g',
-      countryOfOrigin: 'South Korea',
-      packagingType: 'Jar / Tub',
-      skinClaims: ['Deep Hydration', 'Dermatologist Tested'],
-      keyActives: 'Berry Fruit Complex • Vitamin C • Coconut Oil • Shea Butter',
-    ),
-
-    // Bioderma
     '3401575645851': const ProductModel(
       productId: 'curated_bioderma_sensibio',
       barcode: '3401575645851',
@@ -997,46 +1259,5 @@ class ProductLookupService {
     ),
 
     // Minimalist
-    '8906128100010': const ProductModel(
-      productId: 'curated_minimalist_salicylic',
-      barcode: '8906128100010',
-      name: 'Salicylic Acid 2% Face Serum for Acne & Blackheads',
-      brand: 'Minimalist',
-      categoryId: 'serum',
-      paoMonths: 6,
-      volume: '30 ml',
-      countryOfOrigin: 'India',
-      packagingType: 'Dropper Pipette',
-      skinClaims: ['Fragrance-Free', 'Non-Comedogenic', 'Cruelty-Free / Vegan'],
-      keyActives: 'Salicylic Acid (BHA) (2%) • Oligopeptide-10 • EGCG',
-    ),
-    '8906128100140': const ProductModel(
-      productId: 'curated_minimalist_sunscreen',
-      barcode: '8906128100140',
-      name: 'Sunscreen SPF 50 PA++++ with Niacinamide & Multi-Vitamins',
-      brand: 'Minimalist',
-      categoryId: 'sunscreen',
-      paoMonths: 12,
-      volume: '50 g',
-      countryOfOrigin: 'India',
-      packagingType: 'Squeeze Tube',
-      skinClaims: ['SPF Protection', 'Fragrance-Free', 'Non-Comedogenic'],
-      keyActives: 'Niacinamide (Vitamin B3) • Vitamin C • Vitamin E',
-    ),
-
-    // Anua
-    '8809640733852': const ProductModel(
-      productId: 'curated_anua_77_toner',
-      barcode: '8809640733852',
-      name: 'Heartleaf 77% Soothing Toner',
-      brand: 'Anua',
-      categoryId: 'toner',
-      paoMonths: 12,
-      volume: '250 ml',
-      countryOfOrigin: 'South Korea',
-      packagingType: 'Bottle',
-      skinClaims: ['Cruelty-Free / Vegan', 'Fragrance-Free', 'For Sensitive Skin', 'Deep Hydration'],
-      keyActives: 'Houttuynia Cordata (Heartleaf) Extract (77%) • Panthenol (Pro-Vitamin B5) • Centella Asiatica (Cica)',
-    ),
   };
 }

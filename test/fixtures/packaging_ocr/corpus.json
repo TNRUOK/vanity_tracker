@@ -1,0 +1,209 @@
+﻿{
+    "description":  "Synthetic packaging labels rendered on an HTML canvas (exact ground truth; no third-party images). OCR outputs were recorded from the real browser engine. \"enhanced_js\" is the browser-side prototype of the enhanced pass (grayscale + 1% contrast stretch + upscale to 1600 px) that PackagingImagePrep implements in Dart. Expected values: YYYY-MM-DD, YYYY-MM|month (month precision), \"ambiguous\" (day/month order must be chosen by the user), null (nothing should be filled).",
+    "cases":  [
+                  {
+                      "name":  "clean_labels",
+                      "image":  "clean_labels.png",
+                      "truth":  "LOT A7K29\nMFG 2024-10-17\nEXP 10/2027",
+                      "ocr":  {
+                                  "engine":  "Tesseract.js 6.0.1 (self-hosted, LSTM, PSM 6) in headless Microsoft Edge 155",
+                                  "recorded":  "2026-10-19",
+                                  "original":  "LOT A7K29\nMFG 2024-10-17\nEXP 10/2027\n",
+                                  "enhanced_js":  "LOT A7K29\nMFG 2024-10-17\nEXP 10/2027\n"
+                              },
+                      "expected":  {
+                                       "batch_code":  "A7K29",
+                                       "manufacturing":  "2024-10-17",
+                                       "expiry":  "2027-10|month"
+                                   },
+                      "known_limitation":  null
+                  },
+                  {
+                      "name":  "small_text",
+                      "image":  "small_text.png",
+                      "truth":  "BATCH 4021A\nEXP 17 OCT 2027",
+                      "ocr":  {
+                                  "engine":  "Tesseract.js 6.0.1 (self-hosted, LSTM, PSM 6) in headless Microsoft Edge 155",
+                                  "recorded":  "2026-10-19",
+                                  "original":  "BATCH 4021A\nEXP 17 OCT 2027\n",
+                                  "enhanced_js":  "BATCH 4021A\nEXP 17 OCT 2027\n"
+                              },
+                      "expected":  {
+                                       "batch_code":  "4021A",
+                                       "manufacturing":  null,
+                                       "expiry":  "2027-10-17"
+                                   },
+                      "known_limitation":  null
+                  },
+                  {
+                      "name":  "low_contrast",
+                      "image":  "low_contrast.png",
+                      "truth":  "LOT: B23\nBEST BEFORE 05/2026",
+                      "ocr":  {
+                                  "engine":  "Tesseract.js 6.0.1 (self-hosted, LSTM, PSM 6) in headless Microsoft Edge 155",
+                                  "recorded":  "2026-10-19",
+                                  "original":  "LOT: B23\nBEST BEFORE 05/2026\n",
+                                  "enhanced_js":  "LOT: B23\nBEST BEFORE 05/2026\n"
+                              },
+                      "expected":  {
+                                       "batch_code":  "B23",
+                                       "manufacturing":  null,
+                                       "expiry":  "2026-05|month"
+                                   },
+                      "known_limitation":  null
+                  },
+                  {
+                      "name":  "rotated_6deg",
+                      "image":  "rotated_6deg.png",
+                      "truth":  "L: 7K129\nEXP 2027-03-31",
+                      "ocr":  {
+                                  "engine":  "Tesseract.js 6.0.1 (self-hosted, LSTM, PSM 6) in headless Microsoft Edge 155",
+                                  "recorded":  "2026-10-19",
+                                  "original":  "= IINLY\nEXP 2027.03.34\n",
+                                  "enhanced_js":  "= TIN ZY\nEXP 2027-03-31\n"
+                              },
+                      "expected":  {
+                                       "batch_code":  null,
+                                       "manufacturing":  null,
+                                       "expiry":  "2027-03-31"
+                                   },
+                      "known_limitation":  "Tilted first line \"L: 7K129\" is not readable by Tesseract in either pass; the enhanced pass corrects the date (31, not 34). Type the batch code or rotate/crop and rescan."
+                  },
+                  {
+                      "name":  "blurred",
+                      "image":  "blurred.png",
+                      "truth":  "LOT 21C07\nEXP 08/2026",
+                      "ocr":  {
+                                  "engine":  "Tesseract.js 6.0.1 (self-hosted, LSTM, PSM 6) in headless Microsoft Edge 155",
+                                  "recorded":  "2026-10-19",
+                                  "original":  "LOT 21C07\nEXP 08/2026\n",
+                                  "enhanced_js":  "LOT 21C07\nEXP 08/2026\n"
+                              },
+                      "expected":  {
+                                       "batch_code":  "21C07",
+                                       "manufacturing":  null,
+                                       "expiry":  "2026-08|month"
+                                   },
+                      "known_limitation":  null
+                  },
+                  {
+                      "name":  "dot_matrix",
+                      "image":  "dot_matrix.png",
+                      "truth":  "L 3B118\nEXP 11 2027",
+                      "ocr":  {
+                                  "engine":  "Tesseract.js 6.0.1 (self-hosted, LSTM, PSM 6) in headless Microsoft Edge 155",
+                                  "recorded":  "2026-10-19",
+                                  "original":  "",
+                                  "enhanced_js":  ""
+                              },
+                      "expected":  {
+                                       "batch_code":  null,
+                                       "manufacturing":  null,
+                                       "expiry":  null
+                                   },
+                      "known_limitation":  "Dot-matrix (inkjet) print is not recognized by Tesseract at all (no text); use Input Text."
+                  },
+                  {
+                      "name":  "embossed_silver",
+                      "image":  "embossed_silver.png",
+                      "truth":  "B.NO K42\nEXP 09/2028",
+                      "ocr":  {
+                                  "engine":  "Tesseract.js 6.0.1 (self-hosted, LSTM, PSM 6) in headless Microsoft Edge 155",
+                                  "recorded":  "2026-10-19",
+                                  "original":  "K42\n09/2028\n",
+                                  "enhanced_js":  "B.N 0  K42                                                                f\nEXP 09/2028                             |\n"
+                              },
+                      "expected":  {
+                                       "batch_code":  null,
+                                       "manufacturing":  null,
+                                       "expiry":  "2028-09|month"
+                                   },
+                      "known_limitation":  "The \"B.NO\" label is read as \"B.N 0\", so K42 is offered only as an unlabeled candidate (not auto-filled)."
+                  },
+                  {
+                      "name":  "barcode_and_batch",
+                      "image":  "barcode_and_batch.png",
+                      "truth":  "8801234567893\nBATCH NO. 4021A\nBBE 17 OCT 2027",
+                      "ocr":  {
+                                  "engine":  "Tesseract.js 6.0.1 (self-hosted, LSTM, PSM 6) in headless Microsoft Edge 155",
+                                  "recorded":  "2026-10-19",
+                                  "original":  "8801234567893\nBATCH NO. 4021A\nBBE 17 OCT 2027\n",
+                                  "enhanced_js":  "8801234567893\nBATCH NO. 4021A\nBBE 17 OCT 2027\n"
+                              },
+                      "expected":  {
+                                       "batch_code":  "4021A",
+                                       "manufacturing":  null,
+                                       "expiry":  "2027-10-17"
+                                   },
+                      "known_limitation":  null
+                  },
+                  {
+                      "name":  "label_on_own_line",
+                      "image":  "label_on_own_line.png",
+                      "truth":  "MFD\n2025-02\nEXP\n2028-02",
+                      "ocr":  {
+                                  "engine":  "Tesseract.js 6.0.1 (self-hosted, LSTM, PSM 6) in headless Microsoft Edge 155",
+                                  "recorded":  "2026-10-19",
+                                  "original":  "MFD\n2025-02\nEXP\n2028-02\n",
+                                  "enhanced_js":  "MFD\n2025-02\nEXP\n2028-02\n"
+                              },
+                      "expected":  {
+                                       "batch_code":  null,
+                                       "manufacturing":  "2025-02|month",
+                                       "expiry":  "2028-02|month"
+                                   },
+                      "known_limitation":  null
+                  },
+                  {
+                      "name":  "pao_size_decoys",
+                      "image":  "pao_size_decoys.png",
+                      "truth":  "12M   50ml\nLOT B23   EXP 05/2026",
+                      "ocr":  {
+                                  "engine":  "Tesseract.js 6.0.1 (self-hosted, LSTM, PSM 6) in headless Microsoft Edge 155",
+                                  "recorded":  "2026-10-19",
+                                  "original":  "12M 50ml\nLOT B23 EXP 05/2026\n",
+                                  "enhanced_js":  "12M 50m\nLOT B23 EXP 05/2026\n"
+                              },
+                      "expected":  {
+                                       "batch_code":  "B23",
+                                       "manufacturing":  null,
+                                       "expiry":  "2026-05|month"
+                                   },
+                      "known_limitation":  null
+                  },
+                  {
+                      "name":  "ambiguous_dates",
+                      "image":  "ambiguous_dates.png",
+                      "truth":  "MFD 04/05/2024\nEXP 04/05/2027",
+                      "ocr":  {
+                                  "engine":  "Tesseract.js 6.0.1 (self-hosted, LSTM, PSM 6) in headless Microsoft Edge 155",
+                                  "recorded":  "2026-10-19",
+                                  "original":  "MFD 04/05/2024\nEXP 04/05/2027\n",
+                                  "enhanced_js":  "MFD 04/05/2024\nEXP 04/05/2027\n"
+                              },
+                      "expected":  {
+                                       "batch_code":  null,
+                                       "manufacturing":  "ambiguous",
+                                       "expiry":  "ambiguous"
+                                   },
+                      "known_limitation":  null
+                  },
+                  {
+                      "name":  "marketing_only",
+                      "image":  "marketing_only.png",
+                      "truth":  "Hydrating Gel Cream\nwith Hyaluronic Acid\nDermatologist tested",
+                      "ocr":  {
+                                  "engine":  "Tesseract.js 6.0.1 (self-hosted, LSTM, PSM 6) in headless Microsoft Edge 155",
+                                  "recorded":  "2026-10-19",
+                                  "original":  "Hydrating Gel Cream\nwith Hyaluronic Acid\nDermatologist tested\n",
+                                  "enhanced_js":  "Hydrating Gel Cream\nwith Hyaluronic Acid\nDermatologist tested\n"
+                              },
+                      "expected":  {
+                                       "batch_code":  null,
+                                       "manufacturing":  null,
+                                       "expiry":  null
+                                   },
+                      "known_limitation":  null
+                  }
+              ]
+}

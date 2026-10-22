@@ -51,7 +51,7 @@ class CountdownBadge extends StatelessWidget {
       case VanityStatus.active:
         badgeColor = AppTheme.statusGreen;
         bgColor = AppTheme.statusGreenBg;
-        text = '$days days left';
+        text = days != null ? '$days days left' : 'Opened · expiry unknown';
         icon = Icons.spa_outlined;
         break;
     }

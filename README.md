@@ -55,6 +55,27 @@
 - Fully functional in offline/guest mode right out of the box using local persistent caching.
 - Seamlessly syncs to Google Cloud Firestore and Firebase Authentication when connected.
 
+### 🧾 8. On-Device Receipt Scanning & Purchase Confirmation
+- **On-Device OCR**: Reads paper receipts and e-receipt screenshots directly on-device using ML Kit without uploading images to cloud APIs.
+- **Conservative Receipt Extraction**: Extracts merchant name, purchase date (with ambiguity detection and 1-tap toggling), currency symbol, subtotal, tax, discount, total, and line items.
+- **Price Protection & Safe Confirmation**: Draft purchases remain separate until reviewed and confirmed. When matching a receipt line to existing inventory, shelf item prices are preserved by default unless the user explicitly confirms the change.
+- **Spending Source of Truth**: Unified spending calculations (`calculateUnifiedSpending`) ensure purchases are counted only once (inventory items linked to receipt lines are not double-counted). Receipts in foreign currencies are kept separate from domestic totals.
+
+### 💖 9. Wishlist Management & Cross-Shelf Duplicate Detection
+- Track desired beauty products with categories, notes, and target purchase prices.
+- **Cross-Shelf Duplicate Detection**: Automatically alerts you if a wishlisted item is already owned on your active shelf or shared by a household member (matching exact barcodes or normalized brand/name).
+- **Move to Vanity Shelf**: 1-tap conversion turns wishlisted items into active vanity items with prefilled catalog details and removes them from your wishlist.
+
+### 👥 10. Secure Household Sharing & Duplicate Detection
+- Invite household members via email with expiring invitations.
+- Personal items remain private by default; sharing is explicit per item and fully reversible.
+- Departure safety: leaving a household revokes access and unshares all items.
+
+### 📦 11. JSON Inventory Backup & Restore (Schema V2)
+- Export complete inventory, wishlist, and verified receipts to a standardized Schema V2 JSON file.
+- Full backward compatibility with Schema V1 backups.
+- Safe-merge logic and target user reassignment protect against data loss.
+
 ---
 
 ## 📱 App Architecture
@@ -122,10 +143,32 @@ lib/
    - Add your `GoogleService-Info.plist` to `ios/Runner/`.
    *Note: If no Firebase config is present, the app gracefully defaults to offline local mode.*
 
-4. **Run the application:**
+4. **Run the invitation email backend (optional, for email delivery):**
    ```bash
-   flutter run
+   cd server
+   npm install
+   # Copy template to .env and configure GMAIL_USER and GMAIL_APP_PASSWORD
+   cp .env.example .env
+   npm start
    ```
+
+5. **Run the application:**
+   - **Chrome / Web:**
+     ```bash
+     flutter run -d chrome
+     ```
+   - **Android Emulator:**
+     ```bash
+     flutter run -d emulator-id
+     ```
+     *(Default invitation server address http://10.0.2.2:8787 connects automatically to laptop localhost:8787)*
+   - **Physical Android Phone:**
+     1. Set `HOST=0.0.0.0` in `server/.env` (on trusted private Wi-Fi).
+     2. Start the email server: `cd server && npm start`.
+     3. Run the app with your laptop's local LAN IP:
+        ```bash
+        flutter run -d <device-id> --dart-define=INVITE_API_BASE_URL=http://<YOUR_LAPTOP_LAN_IP>:8787
+        ```
 
 ---
 

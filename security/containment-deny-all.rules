@@ -1,0 +1,13 @@
+rules_version = '2';
+
+// EMERGENCY CONTAINMENT ONLY - NOT DEPLOYED.
+// Denies every client read and write. Deploying this stops all Firestore-backed features of
+// the app (sync, receipts, households, invitations) until firestore.rules is deployed.
+// Admin tools (Firebase console, Admin SDK) are not affected by security rules.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

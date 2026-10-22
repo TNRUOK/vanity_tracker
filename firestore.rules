@@ -1,0 +1,293 @@
+rules_version = '2';
+
+// ============================================================================
+// FIRESTORE SECURITY RULES - VANITY TRACKER
+//
+// STATUS: LOCAL VERSION UNDER REVIEW (NOT DEPLOYED FROM THIS WORKSPACE).
+//   The rules in this repository are the local version being reviewed.
+//   The reported Firestore emulator tests passed 60/60.
+//   These changes have not been deployed from this workspace.
+//   The exact currently deployed rules in the live project must be verified separately.
+//   There is no catch-all match: any path not matched below (including subcollections)
+//   is denied.
+//
+// Field names match what the app actually writes (snake_case, see lib/models).
+//
+// 1. Every operation requires a signed-in user. Unknown collections are denied.
+// 2. Personal inventory, wishlists and receipts are private to their owner; ownership
+//    (user_id) can never be changed.
+// 3. Inventory items are readable by household members only when their owner shared
+//    them, and only into a household the owner belongs to.
+// 4. Households: members read; nobody can be added without an accepted invitation;
+//    the owner may rename, remove members or hand ownership to an existing member.
+// 5. Invitations: only the owner creates; only the invited, VERIFIED e-mail account can
+//    read/accept/decline as the recipient.
+// 6. Shared product catalog: readable by signed-in users; a document can be changed or
+//    deleted only by the user who created it.
+// 7. No client can use the legacy /mail queue.
+// ============================================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function uid() {
+      return request.auth.uid;
+    }
+
+    function myEmail() {
+      return request.auth.token.email.lower();
+    }
+
+    // Without verification anyone could register the invitee's address and join.
+    function hasVerifiedEmail() {
+      return isAuthenticated() && request.auth.token.get('email_verified', false) == true;
+    }
+
+    function householdPath(householdId) {
+      return /databases/$(database)/documents/households/$(householdId);
+    }
+
+    function invitationPath(invitationId) {
+      return /databases/$(database)/documents/household_invitations/$(invitationId);
+    }
+
+    function isHouseholdMember(householdId) {
+      return isAuthenticated() && householdId is string && exists(householdPath(householdId)) &&
+        uid() in get(householdPath(householdId)).data.member_uids;
+    }
+
+    function isHouseholdOwner(householdId) {
+      return isAuthenticated() && exists(householdPath(householdId)) &&
+        get(householdPath(householdId)).data.created_by == uid();
+    }
+
+    function changedKeys() {
+      return request.resource.data.diff(resource.data).affectedKeys();
+    }
+
+    // --- Users: private profile pointer (household_id only) ---
+    match /users/{userId} {
+      allow read, delete: if isAuthenticated() && uid() == userId;
+      allow create, update: if isAuthenticated() && uid() == userId &&
+        request.resource.data.keys().hasOnly(['household_id']) &&
+        (!('household_id' in request.resource.data) || request.resource.data.household_id is string);
+    }
+
+    // --- Vanity Items ---
+    match /vanity_items/{itemId} {
+      function sharedAfter() {
+        return request.resource.data.get('is_shared_with_household', false) == true;
+      }
+
+      // Sharing may only target a household the owner currently belongs to.
+      function shareTargetValid() {
+        return !sharedAfter() || isHouseholdMember(request.resource.data.get('shared_household_id', null));
+      }
+
+      // An item that stays shared to the same household is not re-validated, so an owner
+      // can still edit an item whose household they have since left (and then unshare it).
+      function sharingUnchanged() {
+        return request.resource.data.get('is_shared_with_household', false) ==
+                 resource.data.get('is_shared_with_household', false) &&
+               request.resource.data.get('shared_household_id', null) ==
+                 resource.data.get('shared_household_id', null);
+      }
+
+      allow read: if isAuthenticated() && (
+        resource.data.user_id == uid() ||
+        (
+          resource.data.get('is_shared_with_household', false) == true &&
+          isHouseholdMember(resource.data.get('shared_household_id', null))
+        )
+      );
+      allow create: if isAuthenticated() &&
+        request.resource.data.user_id == uid() &&
+        request.resource.data.get('is_shared_with_household', false) is bool &&
+        shareTargetValid();
+      allow update: if isAuthenticated() &&
+        resource.data.user_id == uid() &&
+        request.resource.data.user_id == uid() &&
+        request.resource.data.get('is_shared_with_household', false) is bool &&
+        (sharingUnchanged() || shareTargetValid());
+      allow delete: if isAuthenticated() && resource.data.user_id == uid();
+    }
+
+    // --- Households ---
+    match /households/{householdId} {
+      allow read: if isAuthenticated() && uid() in resource.data.member_uids;
+
+      // Created with only the creator as member, listed under their own e-mail.
+      allow create: if isAuthenticated() &&
+        request.resource.data.household_id == householdId &&
+        request.resource.data.name is string && request.resource.data.name.size() <= 100 &&
+        request.resource.data.created_by == uid() &&
+        request.resource.data.member_uids == [uid()] &&
+        request.resource.data.member_emails.keys().hasOnly([uid()]) &&
+        request.resource.data.member_emails[uid()] == myEmail();
+
+      allow update: if isAuthenticated() && (
+        // Owner: rename, remove members, or hand ownership to a remaining member.
+        // The owner can NOT add anyone (members join only through an invitation).
+        (
+          resource.data.created_by == uid() &&
+          changedKeys().hasOnly(['name', 'created_by', 'member_uids', 'member_emails']) &&
+          resource.data.member_uids.hasAll(request.resource.data.member_uids) &&
+          resource.data.member_emails.keys().hasAll(request.resource.data.member_emails.keys()) &&
+          request.resource.data.created_by in request.resource.data.member_uids
+        ) ||
+
+        // A member leaves: removes only themself, nothing else changes except their email entry.
+        (
+          uid() in resource.data.member_uids &&
+          !(uid() in request.resource.data.member_uids) &&
+          request.resource.data.member_uids.hasOnly(resource.data.member_uids.removeAll([uid()])) &&
+          request.resource.data.member_uids.hasAll(resource.data.member_uids.removeAll([uid()])) &&
+          request.resource.data.member_uids.size() == resource.data.member_uids.size() - 1 &&
+          uid() in resource.data.member_emails &&
+          !(uid() in request.resource.data.member_emails) &&
+          request.resource.data.member_emails.diff(resource.data.member_emails).affectedKeys().hasOnly([uid()]) &&
+          request.resource.data.created_by == resource.data.created_by &&
+          request.resource.data.name == resource.data.name &&
+          changedKeys().hasOnly(['member_uids', 'member_emails'])
+        ) ||
+
+        // An invited user joins: adds only themself, backed by an invitation for this
+        // household and their verified email that is being accepted in the same batch.
+        (
+          hasVerifiedEmail() &&
+          !(uid() in resource.data.member_uids) &&
+          changedKeys().hasOnly(['member_uids', 'member_emails', 'last_join_invitation_id']) &&
+          request.resource.data.member_uids.hasAll(resource.data.member_uids) &&
+          request.resource.data.member_uids.removeAll(resource.data.member_uids).hasOnly([uid()]) &&
+          request.resource.data.member_emails.diff(resource.data.member_emails).affectedKeys().hasOnly([uid()]) &&
+          request.resource.data.member_emails[uid()] == myEmail() &&
+          get(invitationPath(request.resource.data.last_join_invitation_id)).data.status == 'pending' &&
+          getAfter(invitationPath(request.resource.data.last_join_invitation_id)).data.status == 'accepted' &&
+          getAfter(invitationPath(request.resource.data.last_join_invitation_id)).data.household_id == householdId &&
+          getAfter(invitationPath(request.resource.data.last_join_invitation_id)).data.invited_email == myEmail()
+        )
+      );
+
+      // Only the owner, and only once they are the last member (the app deletes an
+      // empty household when its last member leaves).
+      allow delete: if isAuthenticated() &&
+        resource.data.created_by == uid() &&
+        resource.data.member_uids == [uid()];
+    }
+
+    // --- Household Invitations ---
+    match /household_invitations/{invitationId} {
+      allow read: if isAuthenticated() && (
+        resource.data.invited_by_uid == uid() ||
+        (hasVerifiedEmail() && resource.data.invited_email == myEmail()) ||
+        isHouseholdMember(resource.data.household_id)
+      );
+
+      // Only the household owner creates invitations, as themself, pending, with a future
+      // expiry, and with exactly the fields the app writes (no pre-filled acceptance).
+      allow create: if isAuthenticated() &&
+        request.resource.data.keys().hasOnly([
+          'invitation_id', 'household_id', 'household_name', 'invited_email', 'invited_by_uid',
+          'invited_by_name', 'created_at', 'expires_at', 'expires_at_ms', 'status',
+          'email_delivery_status', 'email_delivery_error'
+        ]) &&
+        request.resource.data.invitation_id == invitationId &&
+        request.resource.data.household_id is string &&
+        isHouseholdOwner(request.resource.data.household_id) &&
+        request.resource.data.invited_by_uid == uid() &&
+        request.resource.data.status == 'pending' &&
+        request.resource.data.invited_email is string &&
+        request.resource.data.invited_email == request.resource.data.invited_email.lower() &&
+        request.resource.data.invited_email != myEmail() &&
+        request.resource.data.expires_at_ms is int &&
+        request.resource.data.expires_at_ms > request.time.toMillis() &&
+        request.resource.data.expires_at_ms <= request.time.toMillis() + 8 * 24 * 60 * 60 * 1000 &&
+        request.resource.data.email_delivery_status in ['queued', 'notConfigured'];
+
+      allow update: if isAuthenticated() && (
+        // Recipient (verified e-mail) accepts or declines a pending, unexpired invitation.
+        (
+          hasVerifiedEmail() &&
+          resource.data.invited_email == myEmail() &&
+          resource.data.status == 'pending' &&
+          resource.data.expires_at_ms is int &&
+          request.time.toMillis() < resource.data.expires_at_ms &&
+          (
+            (request.resource.data.status == 'accepted' &&
+              request.resource.data.accepted_by_uid == uid() &&
+              changedKeys().hasOnly(['status', 'responded_at', 'accepted_by_uid'])) ||
+            (request.resource.data.status == 'declined' &&
+              changedKeys().hasOnly(['status', 'responded_at']))
+          )
+        ) ||
+        // Inviter or household owner revokes.
+        (
+          (resource.data.invited_by_uid == uid() || isHouseholdOwner(resource.data.household_id)) &&
+          resource.data.status == 'pending' &&
+          request.resource.data.status == 'revoked' &&
+          changedKeys().hasOnly(['status', 'responded_at'])
+        ) ||
+        // Inviter (or the invite server using the inviter's token) records email delivery.
+        (
+          resource.data.invited_by_uid == uid() &&
+          changedKeys().hasOnly([
+            'email_delivery_status', 'email_delivery_error', 'email_attempts',
+            'email_last_attempt_at', 'email_sent_at', 'email_message_id', 'email_provider_response'
+          ]) &&
+          request.resource.data.email_delivery_status in ['queued', 'sent', 'failed', 'notConfigured']
+        )
+      );
+
+      allow delete: if isAuthenticated() && (
+        resource.data.invited_by_uid == uid() ||
+        isHouseholdOwner(resource.data.household_id)
+      );
+    }
+
+    // --- Products Catalog (shared barcode cache; items embed their own copy) ---
+    match /products/{productId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && request.resource.data.created_by == uid();
+      // Documents written before created_by existed cannot be changed by anyone.
+      allow update: if isAuthenticated() &&
+        resource.data.get('created_by', null) == uid() &&
+        request.resource.data.created_by == uid();
+      allow delete: if isAuthenticated() && resource.data.get('created_by', null) == uid();
+    }
+
+    // --- Categories (read-only metadata) ---
+    match /categories/{categoryId} {
+      allow read: if isAuthenticated();
+      allow write: if false;
+    }
+
+    // --- Wishlists (personal) ---
+    match /wishlists/{wishlistId} {
+      allow read, delete: if isAuthenticated() && resource.data.user_id == uid();
+      allow create: if isAuthenticated() && request.resource.data.user_id == uid();
+      allow update: if isAuthenticated() &&
+        resource.data.user_id == uid() &&
+        request.resource.data.user_id == uid();
+    }
+
+    // --- Receipts and their line items / spending (personal) ---
+    match /receipts/{receiptId} {
+      allow read, delete: if isAuthenticated() && resource.data.user_id == uid();
+      allow create: if isAuthenticated() &&
+        request.resource.data.user_id == uid() &&
+        request.resource.data.get('total_amount', 0) is number;
+      allow update: if isAuthenticated() &&
+        resource.data.user_id == uid() &&
+        request.resource.data.user_id == uid();
+    }
+
+    // --- Legacy mail queue: no client access (the invite server sends directly) ---
+    match /mail/{mailId} {
+      allow read, write: if false;
+    }
+  }
+}

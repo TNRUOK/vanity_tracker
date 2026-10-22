@@ -2,6 +2,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:vanity_tracker/models/category_model.dart';
 import 'package:vanity_tracker/models/product_model.dart';
 import 'package:vanity_tracker/models/vanity_item_model.dart';
+import 'package:vanity_tracker/services/notification_service.dart';
 
 void main() {
   group('PAO Expiry Calculation Tests', () {
@@ -168,6 +169,202 @@ void main() {
       expect(reconstructed.paoMonths, prod.paoMonths);
       expect(reconstructed.volume, prod.volume);
       expect(reconstructed.ingredients, prod.ingredients);
+    });
+  });
+
+  group('Sealed Batch Expiry & Effective Expiry Logic', () {
+    final now = DateTime.now();
+
+    test('effectiveExpiryDate picks earlier of sealed expiry and PAO expiry', () {
+      final paoExpiry = now.add(const Duration(days: 365));
+      final sealedExpiry = now.add(const Duration(days: 180));
+
+      final item = VanityItemModel(
+        vanityItemId: 'sealed_1',
+        productId: 'prod_1',
+        userId: 'user_1',
+        openedDate: now,
+        expiryDate: paoExpiry,
+        sealedExpiryDate: sealedExpiry,
+        status: 'active',
+      );
+
+      // Sealed expiry is sooner, so it should be the effective date
+      expect(item.effectiveExpiryDate, sealedExpiry);
+      expect(item.daysUntilExpiry, closeTo(180, 2));
+    });
+
+    test('effectiveExpiryDate picks PAO expiry when PAO is earlier than sealed expiry', () {
+      final paoExpiry = now.add(const Duration(days: 90));
+      final sealedExpiry = now.add(const Duration(days: 365));
+
+      final item = VanityItemModel(
+        vanityItemId: 'sealed_2',
+        productId: 'prod_2',
+        userId: 'user_1',
+        openedDate: now,
+        expiryDate: paoExpiry,
+        sealedExpiryDate: sealedExpiry,
+        status: 'active',
+      );
+
+      // PAO expiry is sooner, so it should be the effective date
+      expect(item.effectiveExpiryDate, paoExpiry);
+      expect(item.daysUntilExpiry, closeTo(90, 2));
+    });
+
+    test('Unopened item with sealed expiry date computes daysUntilExpiry', () {
+      final sealedExpiry = now.add(const Duration(days: 60));
+
+      final item = VanityItemModel(
+        vanityItemId: 'sealed_3',
+        productId: 'prod_3',
+        userId: 'user_1',
+        sealedExpiryDate: sealedExpiry,
+        status: 'unopened',
+      );
+
+      expect(item.openedDate, isNull);
+      expect(item.expiryDate, isNull);
+      expect(item.effectiveExpiryDate, sealedExpiry);
+      expect(item.daysUntilExpiry, closeTo(60, 2));
+      // Status remains unopened
+      expect(item.computedStatus, VanityStatus.unopened);
+    });
+
+    test('VanityItemModel toMap and fromMap preserves sealedExpiryDate', () {
+      final sealed = DateTime(2027, 8, 20);
+      final item = VanityItemModel(
+        vanityItemId: 'sealed_ser_1',
+        productId: 'prod_10',
+        userId: 'user_1',
+        sealedExpiryDate: sealed,
+        status: 'unopened',
+      );
+
+      final map = item.toMap();
+      expect(map['sealed_expiry_date'], isNotNull);
+
+      final restored = VanityItemModel.fromMap(map);
+      expect(restored.sealedExpiryDate?.year, 2027);
+      expect(restored.sealedExpiryDate?.month, 8);
+      expect(restored.sealedExpiryDate?.day, 20);
+    });
+
+    test('effectiveExpiryDate returns null when both expiry dates are null', () {
+      const item = VanityItemModel(
+        vanityItemId: 'sealed_null_1',
+        productId: 'prod_null',
+        userId: 'user_1',
+      );
+      expect(item.effectiveExpiryDate, isNull);
+      expect(item.daysUntilExpiry, isNull);
+    });
+
+    test('effectiveExpiryDate returns exact date when PAO and sealed expiry are identical', () {
+      final targetDate = now.add(const Duration(days: 120));
+      final item = VanityItemModel(
+        vanityItemId: 'sealed_identical_1',
+        productId: 'prod_identical',
+        userId: 'user_1',
+        openedDate: now,
+        expiryDate: targetDate,
+        sealedExpiryDate: targetDate,
+        status: 'active',
+      );
+      expect(item.effectiveExpiryDate, targetDate);
+    });
+
+    test('Backward compatibility: legacy record without sealed_expiry_date deserializes safely', () {
+      final legacyMap = {
+        'vanity_item_id': 'legacy_101',
+        'product_id': 'prod_legacy',
+        'user_id': 'user_legacy',
+        'opened_date': '2026-01-01T00:00:00.000',
+        'expiry_date': '2027-01-01T00:00:00.000',
+        'status': 'active',
+        // Note: 'sealed_expiry_date' is intentionally absent
+      };
+
+      final item = VanityItemModel.fromMap(legacyMap);
+      expect(item.vanityItemId, 'legacy_101');
+      expect(item.sealedExpiryDate, isNull);
+      expect(item.expiryDate, DateTime(2027, 1, 1));
+      expect(item.effectiveExpiryDate, DateTime(2027, 1, 1));
+      expect(item.price, isNull);
+      expect(item.notes, isNull);
+      expect(item.finishedDate, isNull);
+      expect(item.wouldRepurchase, isNull);
+    });
+  });
+
+  group('NotificationService Resilience', () {
+    test('Initializes cleanly without throwing LateInitializationError or PlatformException', () async {
+      final service = NotificationService();
+      await expectLater(service.initialize(), completes);
+    });
+
+    test('scheduleExpiryNotifications completes gracefully even in headless environment', () async {
+      final service = NotificationService();
+      await service.initialize();
+      final now = DateTime.now();
+      final item = VanityItemModel(
+        vanityItemId: 'notify_test_1',
+        productId: 'prod_notify_1',
+        userId: 'user_1',
+        openedDate: now,
+        expiryDate: now.add(const Duration(days: 45)),
+        status: 'active',
+      );
+      await expectLater(
+        service.scheduleExpiryNotifications(item),
+        completes,
+      );
+    });
+
+    test('scheduleExpiryNotifications handles unopened items with sealed expiry', () async {
+      final service = NotificationService();
+      await service.initialize();
+      final now = DateTime.now();
+      final item = VanityItemModel(
+        vanityItemId: 'notify_unopened_1',
+        productId: 'prod_unopened_1',
+        userId: 'user_1',
+        sealedExpiryDate: now.add(const Duration(days: 60)),
+        status: 'unopened',
+      );
+      await expectLater(
+        service.scheduleExpiryNotifications(item),
+        completes,
+      );
+    });
+
+    test('scheduleExpiryNotifications safely skips finished items', () async {
+      final service = NotificationService();
+      await service.initialize();
+      final now = DateTime.now();
+      final item = VanityItemModel(
+        vanityItemId: 'notify_finished_1',
+        productId: 'prod_fin_1',
+        userId: 'user_1',
+        openedDate: now.subtract(const Duration(days: 100)),
+        expiryDate: now.add(const Duration(days: 200)),
+        finishedDate: now,
+        status: 'finished',
+      );
+      await expectLater(
+        service.scheduleExpiryNotifications(item),
+        completes,
+      );
+    });
+
+    test('cancelItemNotifications executes without error', () async {
+      final service = NotificationService();
+      await service.initialize();
+      await expectLater(
+        service.cancelItemNotifications('notify_test_1'),
+        completes,
+      );
     });
   });
 }

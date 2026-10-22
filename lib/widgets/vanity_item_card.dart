@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
+import '../models/product_model.dart';
 import '../models/vanity_item_model.dart';
 import '../theme/app_theme.dart';
+import '../utils/currency.dart';
 import 'countdown_badge.dart';
 
 class VanityItemCard extends StatelessWidget {
@@ -23,7 +25,13 @@ class VanityItemCard extends StatelessWidget {
     final product = item.product;
     final brand = product?.brand ?? 'Unknown Brand';
     final name = product?.name ?? 'Cosmetic Product';
-    final pao = product?.paoMonths ?? 12;
+    final pao = product?.knownPaoMonths;
+    final paoSource = product?.paoSource ?? PaoSource.unknown;
+    // Verified or database values are shown plainly; estimates are marked with "~".
+    final paoBadge = pao == null
+        ? 'PAO ?'
+        : (paoSource.isVerified || paoSource == PaoSource.productDatabase ? '${pao}M PAO' : '~${pao}M PAO');
+    final expiry = item.effectiveExpiryDate;
     final statusColor = AppTheme.getStatusColor(item.daysUntilExpiry, isUnopened: item.openedDate == null, isFinished: item.status == 'finished');
 
     return Container(
@@ -87,7 +95,7 @@ class VanityItemCard extends StatelessWidget {
                               ),
                               if (item.price != null && item.price! > 0)
                                 Text(
-                                  '\$${item.price!.toStringAsFixed(2)}',
+                                  formatInCurrency(item.priceCurrency, item.price!),
                                   style: const TextStyle(
                                     fontSize: 13,
                                     fontWeight: FontWeight.w700,
@@ -125,7 +133,7 @@ class VanityItemCard extends StatelessWidget {
                                     const Icon(Icons.av_timer, size: 12, color: AppTheme.textMuted),
                                     const SizedBox(width: 3),
                                     Text(
-                                      '${pao}M PAO',
+                                      paoBadge,
                                       style: const TextStyle(
                                         fontSize: 11,
                                         fontWeight: FontWeight.w600,
@@ -153,6 +161,27 @@ class VanityItemCard extends StatelessWidget {
                                   ),
                                 ),
                               ],
+                              if (item.routineTags.isNotEmpty) ...[
+                                const SizedBox(width: 6),
+                                ...item.routineTags.map((tag) => Padding(
+                                  padding: const EdgeInsets.only(right: 4),
+                                  child: Container(
+                                    padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+                                    decoration: BoxDecoration(
+                                      color: AppTheme.primaryRose.withValues(alpha: 0.1),
+                                      borderRadius: BorderRadius.circular(6),
+                                    ),
+                                    child: Text(
+                                      tag == 'AM' ? '☀️ AM' : (tag == 'PM' ? '🌙 PM' : '📅 $tag'),
+                                      style: const TextStyle(
+                                        fontSize: 10,
+                                        fontWeight: FontWeight.w700,
+                                        color: AppTheme.primaryRose,
+                                      ),
+                                    ),
+                                  ),
+                                )),
+                              ],
                             ],
                           ),
                         ],
@@ -173,7 +202,7 @@ class VanityItemCard extends StatelessWidget {
                     if (item.openedDate != null) ...[
                       CountdownBadge(item: item, isCompact: false),
                       Text(
-                        'Exp: ${DateFormat('MMM d, yyyy').format(item.expiryDate!)}',
+                        expiry != null ? 'Exp: ${DateFormat('MMM d, yyyy').format(expiry)}' : 'Expiry unknown (set PAO)',
                         style: const TextStyle(
                           fontSize: 12,
                           color: AppTheme.textMuted,
@@ -181,7 +210,7 @@ class VanityItemCard extends StatelessWidget {
                         ),
                       ),
                     ] else ...[
-                      const CountdownBadge(item: VanityItemModel(vanityItemId: '', productId: '', userId: ''), isCompact: false),
+                      CountdownBadge(item: item, isCompact: false),
                       if (onMarkOpened != null)
                         ElevatedButton.icon(
                           onPressed: onMarkOpened,

@@ -4,6 +4,7 @@ import 'package:provider/provider.dart';
 import '../../models/vanity_item_model.dart';
 import '../../providers/vanity_provider.dart';
 import '../../theme/app_theme.dart';
+import '../../utils/currency.dart';
 import '../product/product_detail_screen.dart';
 
 class EmptiesScreen extends StatelessWidget {
@@ -114,7 +115,7 @@ class EmptiesScreen extends StatelessWidget {
                               Container(width: 1, height: 36, color: Colors.white24),
                               _buildHeaderMetric(
                                 'Avg Cost/Day',
-                                '\$${vanityProv.averageCostPerDayUsed.toStringAsFixed(2)}',
+                                vanityProv.budgetCurrency.formatAmount(vanityProv.averageCostPerDayUsed),
                               ),
                             ],
                           ),
@@ -268,6 +269,42 @@ class EmptiesScreen extends StatelessWidget {
                           ],
                         ),
                       ),
+                    Semantics(
+                      button: true,
+                      label: 'Restore $name to active vanity',
+                      child: IconButton(
+                        icon: const Icon(Icons.undo_rounded, size: 20, color: AppTheme.primaryRose),
+                        tooltip: 'Restore to Vanity',
+                        constraints: const BoxConstraints(minWidth: 48, minHeight: 48),
+                        onPressed: () async {
+                          final confirm = await showDialog<bool>(
+                            context: context,
+                            builder: (ctx) => AlertDialog(
+                              title: const Text('Restore Product'),
+                              content: Text('Restore "$name" back to your active Vanity Shelf?'),
+                              actions: [
+                                TextButton(onPressed: () => Navigator.of(ctx).pop(false), child: const Text('Cancel')),
+                                ElevatedButton(
+                                  onPressed: () => Navigator.of(ctx).pop(true),
+                                  child: const Text('Restore'),
+                                ),
+                              ],
+                            ),
+                          );
+                          if (confirm == true && context.mounted) {
+                            await context.read<VanityProvider>().restoreFromEmpties(item.vanityItemId);
+                            if (context.mounted) {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(
+                                  content: Text('✨ Product restored to your active Vanity Shelf!'),
+                                  backgroundColor: AppTheme.statusGreen,
+                                ),
+                              );
+                            }
+                          }
+                        },
+                      ),
+                    ),
                   ],
                 ),
                 const SizedBox(height: 12),
@@ -294,7 +331,7 @@ class EmptiesScreen extends StatelessWidget {
                     ),
                     if (item.costPerDay != null)
                       Text(
-                        '\$${item.costPerDay!.toStringAsFixed(2)} / day',
+                        '${formatInCurrency(item.priceCurrency, item.costPerDay!)} / day',
                         style: const TextStyle(
                           fontSize: 13,
                           fontWeight: FontWeight.w700,

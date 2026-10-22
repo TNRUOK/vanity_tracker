@@ -25,6 +25,7 @@ class AuthService {
             userId: fbUser.uid,
             name: fbUser.displayName ?? fbUser.email?.split('@').first ?? 'Beauty Lover',
             email: fbUser.email ?? '',
+            emailVerified: fbUser.emailVerified,
           );
           return _currentUser;
         }
@@ -59,6 +60,7 @@ class AuthService {
           userId: fbUser.uid,
           name: fbUser.displayName ?? email.split('@').first,
           email: fbUser.email ?? email,
+          emailVerified: fbUser.emailVerified,
         );
         _currentUser = user;
         await _saveSession(user);
@@ -96,10 +98,18 @@ class AuthService {
         );
         final fbUser = creds.user!;
         await fbUser.updateDisplayName(name);
+        // Household invitations are bound to an e-mail address, so the address must be
+        // proven before they can be used (enforced by the Firestore rules).
+        try {
+          await fbUser.sendEmailVerification();
+        } catch (e) {
+          debugPrint('Could not send verification e-mail: $e');
+        }
         final user = UserModel(
           userId: fbUser.uid,
           name: name,
           email: fbUser.email ?? email,
+          emailVerified: fbUser.emailVerified,
         );
         _currentUser = user;
         await _saveSession(user);
@@ -121,6 +131,37 @@ class AuthService {
     _currentUser = user;
     await _saveSession(user);
     return user;
+  }
+
+  /// Sends (again) the verification e-mail for the signed-in Firebase account.
+  /// Throws a readable error; does nothing in local/demo mode.
+  Future<void> sendEmailVerification() async {
+    if (!isFirebaseAvailable) return;
+    final fbUser = fb_auth.FirebaseAuth.instance.currentUser;
+    if (fbUser == null) throw Exception('Sign in first.');
+    if (fbUser.emailVerified) return;
+    try {
+      await fbUser.sendEmailVerification();
+    } on fb_auth.FirebaseAuthException catch (e) {
+      throw Exception(e.code == 'too-many-requests'
+          ? 'A verification e-mail was sent recently. Check your inbox and spam folder, then try again later.'
+          : (e.message ?? 'Could not send the verification e-mail.'));
+    }
+  }
+
+  /// Re-reads the Firebase account and forces a new ID token, so that a verification done
+  /// in the e-mail link is visible both to the app and to the Firestore rules
+  /// (`request.auth.token.email_verified`). Returns the updated user.
+  Future<UserModel?> refreshEmailVerification() async {
+    if (!isFirebaseAvailable || _currentUser == null) return _currentUser;
+    final fbUser = fb_auth.FirebaseAuth.instance.currentUser;
+    if (fbUser == null) return _currentUser;
+    await fbUser.reload();
+    final fresh = fb_auth.FirebaseAuth.instance.currentUser ?? fbUser;
+    await fresh.getIdToken(true);
+    _currentUser = _currentUser!.copyWith(emailVerified: fresh.emailVerified, email: fresh.email ?? _currentUser!.email);
+    await _saveSession(_currentUser!);
+    return _currentUser;
   }
 
   /// Sign Out

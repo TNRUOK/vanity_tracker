@@ -11,12 +11,19 @@ class NotificationService {
 
   final FlutterLocalNotificationsPlugin _notificationsPlugin = FlutterLocalNotificationsPlugin();
   bool _initialized = false;
+  bool _pluginAvailable = false;
+
+  /// Tests only: when set, schedule/cancel requests are recorded here
+  /// (`schedule:<itemId>:<expiry ISO>` / `cancel:<itemId>`).
+  @visibleForTesting
+  static List<String>? debugLog;
 
   Future<void> initialize() async {
     if (_initialized) return;
 
     try {
       tz.initializeTimeZones();
+      _resolveLocalLocation();
     } catch (e) {
       debugPrint('Timezone init error: $e');
     }
@@ -44,18 +51,63 @@ class NotificationService {
 
     _initialized = true;
     try {
-      await _notificationsPlugin.initialize(
+      final success = await _notificationsPlugin.initialize(
         settings: initSettings,
         onDidReceiveNotificationResponse: (NotificationResponse response) {
           debugPrint('Notification payload clicked: ${response.payload}');
         },
       );
+      _pluginAvailable = success ?? true;
     } catch (e) {
-      debugPrint('Failed to initialize local notifications: $e');
+      _pluginAvailable = false;
+      debugPrint('Local notifications not supported or available in this environment: $e');
+    }
+  }
+
+  tz.Location _resolveLocalLocation() {
+    try {
+      final now = DateTime.now();
+      final name = now.timeZoneName;
+
+      // 1. Check if direct name exists in timezone database
+      if (tz.timeZoneDatabase.locations.containsKey(name)) {
+        final loc = tz.getLocation(name);
+        tz.setLocalLocation(loc);
+        return loc;
+      }
+
+      // 2. Match by current UTC offset
+      final targetOffset = now.timeZoneOffset;
+      for (final loc in tz.timeZoneDatabase.locations.values) {
+        if (loc.currentTimeZone.offset == targetOffset) {
+          tz.setLocalLocation(loc);
+          return loc;
+        }
+      }
+    } catch (e) {
+      debugPrint('Local timezone detection error: $e');
+    }
+
+    // 3. Fallback to UTC only when device timezone cannot be detected
+    try {
+      final utc = tz.getLocation('UTC');
+      tz.setLocalLocation(utc);
+      return utc;
+    } catch (_) {
+      return tz.UTC;
+    }
+  }
+
+  tz.Location _getLocalLocation() {
+    try {
+      return tz.local;
+    } catch (_) {
+      return _resolveLocalLocation();
     }
   }
 
   Future<void> requestPermissions() async {
+    if (!_pluginAvailable) return;
     try {
       final androidImplementation = _notificationsPlugin
           .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
@@ -73,38 +125,57 @@ class NotificationService {
     }
   }
 
-  /// Schedules 30-day warning and expired-day notifications for a vanity item
+  /// Schedules 30-day, 7-day warning, and expired-day notifications for a vanity item
   Future<void> scheduleExpiryNotifications(VanityItemModel item) async {
-    if (item.expiryDate == null || item.openedDate == null) return;
+    final expiryDate = item.effectiveExpiryDate;
+    if (expiryDate == null) return;
+    if (item.status == 'finished') return;
+
+    // Cancel old notifications first to avoid stale notifications if dates shifted
+    await cancelItemNotifications(item.vanityItemId);
+    debugLog?.add('schedule:${item.vanityItemId}:${expiryDate.toIso8601String()}');
+
     final productName = item.product?.name ?? 'Cosmetic Product';
     final brandName = item.product?.brand ?? '';
     final titlePrefix = brandName.isNotEmpty ? '$brandName $productName' : productName;
 
-    final expiryDate = item.expiryDate!;
     final thirtyDaysBefore = expiryDate.subtract(const Duration(days: 30));
+    final sevenDaysBefore = expiryDate.subtract(const Duration(days: 7));
     final now = DateTime.now();
 
     final baseId = item.vanityItemId.hashCode.abs() % 100000;
-    final warningId = baseId * 2;
-    final expiredId = baseId * 2 + 1;
+    final warning30Id = baseId * 3;
+    final warning7Id = baseId * 3 + 1;
+    final expiredId = baseId * 3 + 2;
 
     // 1. Schedule 30-day warning if in future
     if (thirtyDaysBefore.isAfter(now)) {
       await _scheduleSingleNotification(
-        id: warningId,
+        id: warning30Id,
         title: '⚠️ Expiring Soon: $titlePrefix',
-        body: 'This product will expire in 30 days (PAO limit). Consider finishing it up!',
+        body: 'This product will expire in 30 days. Consider finishing it up!',
         scheduledDate: thirtyDaysBefore,
         payload: item.vanityItemId,
       );
     }
 
-    // 2. Schedule Expiry notification if in future
+    // 2. Schedule 7-day warning if in future
+    if (sevenDaysBefore.isAfter(now)) {
+      await _scheduleSingleNotification(
+        id: warning7Id,
+        title: '⏳ Expiring in 7 Days: $titlePrefix',
+        body: 'Only 1 week left before this product reaches its expiry date.',
+        scheduledDate: sevenDaysBefore,
+        payload: item.vanityItemId,
+      );
+    }
+
+    // 3. Schedule Expiry notification if in future
     if (expiryDate.isAfter(now)) {
       await _scheduleSingleNotification(
         id: expiredId,
         title: '🛑 Expired: $titlePrefix',
-        body: 'This product has reached its Period After Opening (PAO) expiry date today.',
+        body: 'This product has reached its expiry date today.',
         scheduledDate: expiryDate,
         payload: item.vanityItemId,
       );
@@ -122,6 +193,7 @@ class NotificationService {
       if (!_initialized) {
         await initialize();
       }
+      if (!_pluginAvailable) return;
 
       const AndroidNotificationDetails androidDetails = AndroidNotificationDetails(
         'vanity_expiry_channel',
@@ -143,13 +215,8 @@ class NotificationService {
         iOS: iosDetails,
       );
 
-      tz.TZDateTime tzDateTime;
-      try {
-        tzDateTime = tz.TZDateTime.from(scheduledDate, tz.local);
-      } catch (_) {
-        tz.initializeTimeZones();
-        tzDateTime = tz.TZDateTime.from(scheduledDate, tz.local);
-      }
+      final location = _getLocalLocation();
+      final tzDateTime = tz.TZDateTime.from(scheduledDate, location);
 
       await _notificationsPlugin.zonedSchedule(
         id: id,
@@ -168,9 +235,18 @@ class NotificationService {
 
   /// Cancels notifications for an item (e.g. when finished or deleted)
   Future<void> cancelItemNotifications(String vanityItemId) async {
-    if (!_initialized) return;
+    debugLog?.add('cancel:$vanityItemId');
+    if (!_initialized) {
+      await initialize();
+    }
+    if (!_pluginAvailable) return;
+
     try {
       final baseId = vanityItemId.hashCode.abs() % 100000;
+      await _notificationsPlugin.cancel(id: baseId * 3);
+      await _notificationsPlugin.cancel(id: baseId * 3 + 1);
+      await _notificationsPlugin.cancel(id: baseId * 3 + 2);
+      // Also cancel legacy IDs (baseId * 2, baseId * 2 + 1)
       await _notificationsPlugin.cancel(id: baseId * 2);
       await _notificationsPlugin.cancel(id: baseId * 2 + 1);
     } catch (e) {

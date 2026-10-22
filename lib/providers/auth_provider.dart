@@ -11,6 +11,7 @@ class AuthProvider extends ChangeNotifier {
 
   UserModel? get currentUser => _currentUser;
   bool get isAuthenticated => _currentUser != null;
+  bool get isDemoAccount => _currentUser?.isDemoAccount ?? false;
   bool get isLoading => _isLoading;
   String? get errorMessage => _errorMessage;
 
@@ -75,6 +76,29 @@ class AuthProvider extends ChangeNotifier {
     );
     _isLoading = false;
     notifyListeners();
+  }
+
+  /// Re-sends the verification e-mail. Returns an error message, or null on success.
+  Future<String?> sendVerificationEmail() async {
+    try {
+      await _authService.sendEmailVerification();
+      return null;
+    } catch (e) {
+      return e.toString().replaceAll('Exception: ', '');
+    }
+  }
+
+  /// Picks up a verification completed in the e-mail link (reloads the account and
+  /// refreshes the ID token). Returns true when the address is now verified.
+  Future<bool> refreshEmailVerification() async {
+    try {
+      final updated = await _authService.refreshEmailVerification();
+      if (updated != null) _currentUser = updated;
+    } catch (e) {
+      debugPrint('Verification refresh failed: $e');
+    }
+    notifyListeners();
+    return _currentUser?.emailVerified ?? false;
   }
 
   Future<void> signOut() async {

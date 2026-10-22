@@ -2,13 +2,23 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../../models/category_model.dart';
 import '../../providers/auth_provider.dart';
+import '../../providers/household_provider.dart';
+import '../../providers/receipt_provider.dart';
 import '../../providers/vanity_provider.dart';
+import '../../providers/wishlist_provider.dart';
 import '../../theme/app_theme.dart';
 import '../../widgets/category_chip.dart';
+import '../../widgets/opened_feedback.dart';
 import '../../widgets/repurchase_dialog.dart';
 import '../../widgets/vanity_item_card.dart';
+import '../backup/backup_restore_screen.dart';
+import '../guide/pao_guide_screen.dart';
+import '../household/household_screen.dart';
 import '../product/add_product_screen.dart';
 import '../product/product_detail_screen.dart';
+import '../receipt/receipt_history_screen.dart';
+import '../receipt/receipt_scanner_screen.dart';
+import '../wishlist/wishlist_screen.dart';
 
 class VanityDashboardScreen extends StatefulWidget {
   const VanityDashboardScreen({super.key});
@@ -29,6 +39,7 @@ class _VanityDashboardScreenState extends State<VanityDashboardScreen> {
   @override
   Widget build(BuildContext context) {
     final vanityProv = context.watch<VanityProvider>();
+    final wishlistProv = context.watch<WishlistProvider>();
     final auth = context.watch<AuthProvider>();
     final items = vanityProv.activeItems;
     final userName = auth.currentUser?.name ?? 'Skincare Lover';
@@ -68,28 +79,99 @@ class _VanityDashboardScreenState extends State<VanityDashboardScreen> {
                         ),
                       ],
                     ),
-                    IconButton(
-                      icon: const Icon(Icons.logout_rounded, color: AppTheme.textMuted),
-                      tooltip: 'Sign Out',
-                      onPressed: () async {
-                        final confirm = await showDialog<bool>(
-                          context: context,
-                          builder: (ctx) => AlertDialog(
-                            title: const Text('Sign Out'),
-                            content: const Text('Are you sure you want to sign out?'),
-                            actions: [
-                              TextButton(onPressed: () => Navigator.of(ctx).pop(false), child: const Text('Cancel')),
-                              ElevatedButton(
-                                onPressed: () => Navigator.of(ctx).pop(true),
-                                child: const Text('Sign Out'),
-                              ),
-                            ],
-                          ),
-                        );
-                        if (confirm == true && context.mounted) {
-                          await context.read<AuthProvider>().signOut();
-                        }
-                      },
+                    Semantics(
+                      button: true,
+                      label: 'Sign Out',
+                      child: IconButton(
+                        icon: const Icon(Icons.logout_rounded, color: AppTheme.textMuted),
+                        tooltip: 'Sign Out',
+                        constraints: const BoxConstraints(minWidth: 48, minHeight: 48),
+                        onPressed: () => _confirmSignOut(context),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+
+            // Always-Visible Navigation Action Strip
+            SliverToBoxAdapter(
+              child: SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                physics: const BouncingScrollPhysics(),
+                padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 6),
+                child: Row(
+                  children: [
+                    _buildNavActionCard(
+                      context: context,
+                      icon: Icons.favorite_rounded,
+                      iconColor: AppTheme.primaryRose,
+                      title: 'Wishlist',
+                      subtitle: '${wishlistProv.items.length} items',
+                      semanticLabel: 'Wishlist, ${wishlistProv.items.length} items',
+                      onTap: () => Navigator.of(context).push(
+                        MaterialPageRoute(builder: (_) => const WishlistScreen()),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    _buildNavActionCard(
+                      context: context,
+                      icon: Icons.receipt_long_rounded,
+                      iconColor: const Color(0xFF0D9488),
+                      title: 'Scan Receipt',
+                      subtitle: 'OCR Scanner',
+                      semanticLabel: 'Scan Receipt',
+                      onTap: () => Navigator.of(context).push(
+                        MaterialPageRoute(builder: (_) => const ReceiptScannerScreen()),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    _buildNavActionCard(
+                      context: context,
+                      icon: Icons.history_rounded,
+                      iconColor: const Color(0xFF0D9488),
+                      title: 'Receipt History',
+                      subtitle: 'Past logs',
+                      semanticLabel: 'Receipt History',
+                      onTap: () => Navigator.of(context).push(
+                        MaterialPageRoute(builder: (_) => const ReceiptHistoryScreen()),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    _buildNavActionCard(
+                      context: context,
+                      icon: Icons.people_alt_rounded,
+                      iconColor: const Color(0xFF7E22CE),
+                      title: 'Household',
+                      subtitle: 'Shared vanity',
+                      semanticLabel: 'Household Sharing',
+                      onTap: () => Navigator.of(context).push(
+                        MaterialPageRoute(builder: (_) => const HouseholdScreen()),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    _buildNavActionCard(
+                      context: context,
+                      icon: Icons.menu_book_rounded,
+                      iconColor: AppTheme.primaryRose,
+                      title: 'PAO Guide',
+                      subtitle: 'Shelf life',
+                      semanticLabel: 'PAO Reference Guide',
+                      onTap: () => Navigator.of(context).push(
+                        MaterialPageRoute(builder: (_) => const PaoGuideScreen()),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    _buildNavActionCard(
+                      context: context,
+                      icon: Icons.import_export_rounded,
+                      iconColor: const Color(0xFF2563EB),
+                      title: 'Backup / Restore',
+                      subtitle: 'JSON data',
+                      semanticLabel: 'Backup and Restore',
+                      onTap: () => Navigator.of(context).push(
+                        MaterialPageRoute(builder: (_) => const BackupRestoreScreen()),
+                      ),
                     ),
                   ],
                 ),
@@ -215,17 +297,8 @@ class _VanityDashboardScreenState extends State<VanityDashboardScreen> {
                           );
                         },
                         onMarkOpened: item.openedDate == null
-                            ? () async {
-                                await vanityProv.markAsOpened(item.vanityItemId);
-                                if (context.mounted) {
-                                  ScaffoldMessenger.of(context).showSnackBar(
-                                    const SnackBar(
-                                      content: Text('✨ Product marked as opened today!'),
-                                      backgroundColor: AppTheme.statusGreen,
-                                    ),
-                                  );
-                                }
-                              }
+                            // One tap starts the PAO countdown, so the confirmation offers Undo.
+                            ? () => markOpenedWithFeedback(ScaffoldMessenger.of(context), vanityProv, item.vanityItemId)
                             : null,
                         onMarkFinished: () async {
                           final repurchase = await RepurchaseDialog.show(context, item);
@@ -242,6 +315,100 @@ class _VanityDashboardScreenState extends State<VanityDashboardScreen> {
 
             const SliverToBoxAdapter(child: SizedBox(height: 90)),
           ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _confirmSignOut(BuildContext context) async {
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Sign Out'),
+        content: const Text('Are you sure you want to sign out?'),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(ctx).pop(false), child: const Text('Cancel')),
+          ElevatedButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Sign Out'),
+          ),
+        ],
+      ),
+    );
+    if (confirm == true && context.mounted) {
+      context.read<HouseholdProvider>().clear();
+      context.read<VanityProvider>().clear();
+      context.read<WishlistProvider>().clear();
+      context.read<ReceiptProvider>().clear();
+      await context.read<AuthProvider>().signOut();
+    }
+  }
+
+  Widget _buildNavActionCard({
+    required BuildContext context,
+    required IconData icon,
+    required Color iconColor,
+    required String title,
+    required String subtitle,
+    required VoidCallback onTap,
+    required String semanticLabel,
+  }) {
+    return Semantics(
+      button: true,
+      label: semanticLabel,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(14),
+        child: Container(
+          constraints: const BoxConstraints(minHeight: 48, minWidth: 140),
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: const Color(0xFFF1ECE8)),
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black.withValues(alpha: 0.02),
+                blurRadius: 4,
+                offset: const Offset(0, 2),
+              ),
+            ],
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                padding: const EdgeInsets.all(7),
+                decoration: BoxDecoration(
+                  color: iconColor.withValues(alpha: 0.12),
+                  borderRadius: BorderRadius.circular(9),
+                ),
+                child: Icon(icon, color: iconColor, size: 18),
+              ),
+              const SizedBox(width: 10),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    title,
+                    style: const TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w700,
+                      color: AppTheme.textDark,
+                    ),
+                  ),
+                  Text(
+                    subtitle,
+                    style: const TextStyle(
+                      fontSize: 11,
+                      color: AppTheme.textMuted,
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
         ),
       ),
     );

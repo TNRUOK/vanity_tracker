@@ -117,6 +117,92 @@ void main() {
       final emptyItem = provider.empties.firstWhere((i) => i.vanityItemId == created.vanityItemId);
       expect(emptyItem.wouldRepurchase, true);
       expect(emptyItem.finishedDate, isNotNull);
+
+      // Restore from Empties back to active shelf
+      await provider.restoreFromEmpties(created.vanityItemId);
+      expect(provider.empties.any((i) => i.vanityItemId == created.vanityItemId), false);
+      expect(provider.activeItems.any((i) => i.vanityItemId == created.vanityItemId), true);
+      final restoredItem = provider.activeItems.firstWhere((i) => i.vanityItemId == created.vanityItemId);
+      expect(restoredItem.finishedDate, isNull);
+      expect(restoredItem.status, 'active');
+    });
+
+    test('Currency customization and persistence', () async {
+      final provider = VanityProvider();
+      await provider.loadItems('test_user');
+
+      // Default is $
+      expect(provider.currencySymbol, '\$');
+
+      // Change currency to €
+      await provider.setCurrency('€');
+      expect(provider.currencySymbol, '€');
+
+      // Change currency to ₹
+      await provider.setCurrency('₹');
+      expect(provider.currencySymbol, '₹');
+    });
+
+    test('Add item with sealed expiry date', () async {
+      final provider = VanityProvider();
+      await provider.loadItems('test_user');
+
+      const prod = ProductModel(
+        productId: 'batch_test_p',
+        barcode: '1122334455',
+        name: 'Moisturizing Cream',
+        brand: 'CeraVe',
+        categoryId: 'moisturizer',
+        paoMonths: 12,
+      );
+
+      final futureSealed = DateTime.now().add(const Duration(days: 200));
+      final item = await provider.addItem(
+        product: prod,
+        userId: 'test_user',
+        sealedExpiryDate: futureSealed,
+      );
+
+      expect(item.sealedExpiryDate, futureSealed);
+      expect(item.computedStatus, VanityStatus.unopened);
+      expect(item.effectiveExpiryDate, futureSealed);
+    });
+
+    test('clear() empties in-memory items on sign out', () async {
+      final provider = VanityProvider();
+      await provider.loadItems('test_user');
+
+      const prod = ProductModel(
+        productId: 'clear_test_p',
+        barcode: '99887766',
+        name: 'Lip Oil',
+        brand: 'Dior',
+        categoryId: 'lipstick',
+        paoMonths: 12,
+      );
+      await provider.addItem(
+        product: prod,
+        userId: 'test_user',
+      );
+      expect(provider.activeItems.isNotEmpty, true);
+
+      // Sign out / clear
+      provider.clear();
+      expect(provider.activeItems.isEmpty, true);
+      expect(provider.empties.isEmpty, true);
+    });
+
+    test('Demo items are strictly isolated from normal registered users', () async {
+      final demoProvider = VanityProvider();
+      await demoProvider.loadItems('demo_user');
+      // demo_user sees seeded items
+      expect(demoProvider.activeItems.every((i) => i.userId == 'demo_user'), true);
+
+      final normalUserProvider = VanityProvider();
+      await normalUserProvider.loadItems('real_user_xyz_789');
+      // Real user starts clean with 0 demo items
+      expect(normalUserProvider.activeItems.isEmpty, true);
+      expect(normalUserProvider.empties.isEmpty, true);
     });
   });
 }
