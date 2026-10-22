@@ -166,6 +166,8 @@ class ReceiptParserService {
       .trim()
       .replaceAll(RegExp(r'[\s\.\-_:—–=|\$€£₹¥]+$'), '')
       .replaceAll(RegExp(r'\b(?:Rs|RS|INR)\.?$'), '')
+      .replaceAll(RegExp(r'\b(?:Price|Rate|MRP|Amount|Amt)\s*[:=-]?\s*$', caseSensitive: false), '')
+      .replaceAll(RegExp(r'[\s\.\-_:—–=|\$€£₹¥]+$'), '')
       .trim();
 
   static const _months = {
@@ -293,6 +295,7 @@ class ReceiptParserService {
 
     // 2. Detect Merchant Name (first plausible text line near the top)
     String merchant = 'Store Purchase';
+    int? merchantLineIndex;
     for (int i = 0; i < lines.length && i < 5; i++) {
       final line = lines[i];
       if (RegExp(r'^[\d\s\-\/\.:#]+$').hasMatch(line)) continue;
@@ -312,6 +315,7 @@ class ReceiptParserService {
           .trim();
       if (cleaned.length >= 3 && RegExp(r'[A-Za-z]{2,}').hasMatch(cleaned)) {
         merchant = cleaned;
+        merchantLineIndex = i;
         break;
       }
     }
@@ -384,7 +388,7 @@ class ReceiptParserService {
     );
     // A bare label in front of an amount, e.g. "Price: $373.00" printed under the products.
     final summaryLabelRegex = RegExp(
-      r'^(?:TOTAL\s+)?(?:PRICE|AMOUNT(?:\s+PAID)?|AMT|PAID|NET(?:\s+AMOUNT)?|PAYABLE)\s*:?$',
+      r'^(?:TOTAL\s+)?(?:PRICE|AMOUNT(?:\s+PAID)?|AMT|RATE|MRP|PAID|NET(?:\s+AMOUNT)?|PAYABLE)\s*:?$',
       caseSensitive: false,
     );
     // Column headings such as "Item  Qty  Price" or "Description / Amount".
@@ -493,6 +497,7 @@ class ReceiptParserService {
 
     for (int i = 0; i < lines.length; i++) {
       final clean = lines[i];
+      if (merchantLineIndex != null && i == merchantLineIndex) continue;
       if (dateLineIndexes.contains(i) && _amountsIn(clean).isEmpty) continue;
       if (consumedPriceLines.contains(i)) continue;
 
@@ -584,11 +589,17 @@ class ReceiptParserService {
       var desc = _descriptionBefore(clean, amounts.first.start);
 
       // "Price: $373.00" after the products: a total printed under a plain label.
+      // But if we have pendingText from the previous line, this is that product's price!
       if (summaryLabelRegex.hasMatch(desc.trim())) {
-        flushPending();
-        if (lineItems.isNotEmpty && !last.negative) labelTotal ??= lineTotal;
-        totalsReached = lineItems.isNotEmpty || totalsReached;
-        continue;
+        if (pendingText != null) {
+          desc = pendingText!;
+          pendingText = null;
+        } else {
+          flushPending();
+          if (lineItems.isNotEmpty && !last.negative) labelTotal ??= lineTotal;
+          totalsReached = lineItems.isNotEmpty || totalsReached;
+          continue;
+        }
       }
 
       if (last.negative || lineTotal <= 0 || lineTotal >= 1000000) {
@@ -646,7 +657,7 @@ class ReceiptParserService {
     // products do NOT already account for the receipt, and only between the first and
     // last product (headers/footers are never products).
     final pricedSum = lineItems.fold(0.0, (s, i) => s + i.totalPrice);
-    final referenceTotal = grandTotal ?? detectedTotal ?? labelTotal;
+    final referenceTotal = grandTotal ?? detectedTotal ?? labelTotal ?? detectedSubtotal;
     final pricedReconcile =
         (detectedSubtotal != null && (pricedSum - detectedSubtotal).abs() <= 0.02) ||
         (referenceTotal != null &&
@@ -654,19 +665,23 @@ class ReceiptParserService {
     final pricedQty = lineItems.fold(0, (s, i) => s + i.quantity);
     final expected = expectedItemCount;
     final countSatisfied = expected != null && pricedQty >= expected;
-    // Only lines after the first priced product (lines above it are headers/addresses).
-    final candidates = unpriced.where((u) => u.$1 > 0).toList();
+    // Only lines after the first priced product (lines above it are headers/addresses),
+    // OR if lineItems is completely empty, any unpriced line with words (single product receipt).
+    final candidates = lineItems.isEmpty
+        ? unpriced.where((u) => hasWords(u.$2)).toList()
+        : unpriced.where((u) => u.$1 > 0).toList();
     if (candidates.isNotEmpty && !pricedReconcile && !countSatisfied) {
       // Insert from the back so earlier positions stay valid.
       for (final (pos, text) in candidates.reversed) {
+        final insertIndex = pos > lineItems.length ? lineItems.length : pos;
         lineItems.insert(
-          pos,
+          insertIndex,
           ReceiptItemModel(
-            itemId: 'item_np${pos}_${_uuid.v4().substring(0, 4)}',
+            itemId: 'item_np${insertIndex}_${_uuid.v4().substring(0, 4)}',
             description: text,
             unitPrice: 0,
             totalPrice: 0,
-            isConfirmed: false, // price unknown: the review screen asks for it
+            isConfirmed: false, // price unknown: the review screen asks for it or auto-fills from total
           ),
         );
       }

@@ -62,7 +62,7 @@ class _EditPaoDialogState extends State<EditPaoDialog> {
       _ocrMessage = null;
     });
     try {
-      final text = await PackagingOcrService.pickAndRead();
+      final text = await PackagingOcrService.pickAndRead(context: context);
       if (!mounted) return;
       if (text == null) {
         setState(() => _reading = false);

@@ -188,6 +188,50 @@ class _ReceiptReviewScreenState extends State<ReceiptReviewScreen> {
       );
     }).toList();
 
+    final fallbackTotal = d.total > 0 ? d.total : d.subtotal;
+
+    // Auto-create initial draft line if no items were extracted but a total/subtotal was found.
+    if (_lineItems.isEmpty && fallbackTotal > 0) {
+      final defaultName = (d.merchant.isNotEmpty &&
+              d.merchant != 'Store Purchase' &&
+              d.merchant != 'Unidentified Merchant')
+          ? d.merchant
+          : '';
+      _lineItems.add(
+        LineItemDraft(
+          id: 'line_initial_0',
+          name: defaultName,
+          quantity: 1,
+          price: fallbackTotal,
+          action: LineItemAction.createNew,
+          needsReview: true,
+        ),
+      );
+    } else if (fallbackTotal > 0) {
+      // If there is only 1 item and its price is not set, auto-fill it with the extracted total/subtotal.
+      if (_lineItems.length == 1) {
+        final single = _lineItems.first;
+        if (single.unitPrice <= 0) {
+          final q = single.quantity > 0 ? single.quantity : 1;
+          single.priceController.text = (fallbackTotal / q).toStringAsFixed(2);
+        }
+      } else {
+        // If there are multiple items and exactly one is unpriced, infer the remainder from the total.
+        final unpriced = _lineItems.where((l) => l.unitPrice <= 0).toList();
+        if (unpriced.length == 1) {
+          final pricedSum = _lineItems
+              .where((l) => l.unitPrice > 0)
+              .fold<double>(0.0, (sum, l) => sum + l.lineTotal);
+          final rem = fallbackTotal - pricedSum;
+          if (rem > 0) {
+            final targetItem = unpriced.first;
+            final q = targetItem.quantity > 0 ? targetItem.quantity : 1;
+            targetItem.priceController.text = (rem / q).toStringAsFixed(2);
+          }
+        }
+      }
+    }
+
     // Matches are no longer auto-applied (the old substring rule linked lines to shelf items
     // by brand alone). Each line shows its matches from the shared matcher and the user
     // decides: link the purchase, add a separate item (personal/shared), or receipt only.
@@ -274,12 +318,21 @@ class _ReceiptReviewScreenState extends State<ReceiptReviewScreen> {
 
   void _addLineItem() {
     setState(() {
+      final target = _currentTotal > 0 ? _currentTotal : _currentSubtotal;
+      double? suggestedPrice;
+      if (target > 0) {
+        final currentSum = _lineItems.fold<double>(0.0, (sum, item) => sum + item.lineTotal);
+        final rem = target - currentSum;
+        if (rem > 0) {
+          suggestedPrice = double.parse(rem.toStringAsFixed(2));
+        }
+      }
       _lineItems.add(
         LineItemDraft(
           id: 'line_added_${_addedLineCounter++}_${DateTime.now().millisecondsSinceEpoch}',
           name: '',
           quantity: 1,
-          price: null,
+          price: suggestedPrice,
           action: LineItemAction.createNew,
         ),
       );

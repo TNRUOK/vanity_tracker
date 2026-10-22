@@ -135,7 +135,7 @@ class _BatchScanConfirmDialogState extends State<BatchScanConfirmDialog> {
   Future<void> _pickImage() async {
     PickedReceiptImage? picked;
     try {
-      picked = await PackagingOcrService.pickImage();
+      picked = await PackagingOcrService.pickImage(context: context);
     } catch (e) {
       _setStatus('Could not open the selected file ($e). You can type the text instead.', error: true);
       return;

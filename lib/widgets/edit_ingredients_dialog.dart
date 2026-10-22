@@ -59,7 +59,7 @@ class _EditIngredientsDialogState extends State<EditIngredientsDialog> {
       _ocrNote = null;
     });
     try {
-      final text = await PackagingOcrService.pickAndRead();
+      final text = await PackagingOcrService.pickAndRead(context: context);
       if (!mounted) return;
       if (text == null) {
         setState(() => _reading = false);

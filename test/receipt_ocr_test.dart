@@ -1,10 +1,14 @@
+import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:vanity_tracker/models/product_model.dart';
 import 'package:vanity_tracker/models/receipt_model.dart';
 import 'package:vanity_tracker/models/vanity_item_model.dart';
+import 'package:vanity_tracker/providers/auth_provider.dart';
 import 'package:vanity_tracker/providers/receipt_provider.dart';
 import 'package:vanity_tracker/providers/vanity_provider.dart';
+import 'package:vanity_tracker/screens/receipt/receipt_review_screen.dart';
 import 'package:vanity_tracker/services/receipt_parser_service.dart';
 
 void main() {
@@ -312,5 +316,153 @@ Total 16.20
       );
       expect(diffTotal, isNull);
     });
+
+    test('Parses multi-line item where price or MRP is printed on next line', () {
+      const receiptRaw = '''
+NYKAA BEAUTY
+Date: 2026-08-15
+Kiehl's Ultra Facial Cream
+MRP: 450.00
+Total: 450.00
+''';
+      final draft = ReceiptParserService.parseReceiptText(receiptRaw, defaultCurrency: '₹');
+      expect(draft.items, isNotEmpty);
+      expect(draft.items.first.description, contains('Kiehl'));
+      expect(draft.items.first.unitPrice, closeTo(450.00, 0.01));
+    });
+
+    test('Identifies single unpriced product with total for review screen', () {
+      const receiptRaw = '''
+BEAUTY BOUTIQUE
+Date: 2026-09-01
+Vitamin C Daily Glow
+Total: 35.00
+''';
+      final draft = ReceiptParserService.parseReceiptText(receiptRaw, defaultCurrency: '\$');
+      expect(draft.items, isNotEmpty);
+      expect(draft.items.first.description, contains('Vitamin C'));
+      expect(draft.total, closeTo(35.00, 0.01));
+    });
+  });
+
+  group('ReceiptReviewScreen Auto-Fill Price Tests', () {
+    late VanityProvider vanity;
+    late ReceiptProvider receipts;
+    late AuthProvider auth;
+
+    Future<void> pumpReview(WidgetTester tester, ParsedReceiptDraft draft) async {
+      tester.view.physicalSize = const Size(1000, 2400);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+      vanity = VanityProvider();
+      receipts = ReceiptProvider();
+      auth = AuthProvider();
+      await auth.useDemoAccount();
+
+      await tester.pumpWidget(
+        MultiProvider(
+          providers: [
+            ChangeNotifierProvider.value(value: vanity),
+            ChangeNotifierProvider.value(value: receipts),
+            ChangeNotifierProvider.value(value: auth),
+          ],
+          child: MaterialApp(
+            home: ReceiptReviewScreen(initialDraft: draft),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('Auto-fills unit price for single unpriced line when receipt has total', (tester) async {
+      final draft = ParsedReceiptDraft(
+        receiptId: 'rec_test_1',
+        merchant: 'Glow Store',
+        purchaseDate: DateTime(2026, 10, 20),
+        currency: '\$',
+        subtotal: 48.00,
+        tax: 0.0,
+        discount: 0.0,
+        total: 48.00,
+        items: [
+          const ReceiptItemModel(
+            itemId: 'item_1',
+            description: 'Night Repair Serum',
+            quantity: 1,
+            unitPrice: 0.0,
+            totalPrice: 0.0,
+          ),
+        ],
+        rawText: 'Night Repair Serum\nTotal 48.00',
+      );
+
+      await pumpReview(tester, draft);
+
+      final priceField = find.byKey(const Key('line-price-item_1'));
+      expect(priceField, findsOneWidget);
+      final widget = tester.widget<TextField>(priceField);
+      expect(widget.controller?.text, '48.00');
+    });
+
+    testWidgets('Auto-creates draft line item with price prefilled when receipt items is empty', (tester) async {
+      final draft = ParsedReceiptDraft(
+        receiptId: 'rec_test_2',
+        merchant: 'Sephora Express',
+        purchaseDate: DateTime(2026, 10, 20),
+        currency: '\$',
+        subtotal: 65.00,
+        tax: 0.0,
+        discount: 0.0,
+        total: 65.00,
+        items: const [],
+        rawText: 'Total 65.00',
+      );
+
+      await pumpReview(tester, draft);
+
+      final priceField = find.byKey(const Key('line-price-line_initial_0'));
+      expect(priceField, findsOneWidget);
+      final widget = tester.widget<TextField>(priceField);
+      expect(widget.controller?.text, '65.00');
+    });
+
+    testWidgets('Auto-fills unallocated remainder when user adds a new line item', (tester) async {
+      final draft = ParsedReceiptDraft(
+        receiptId: 'rec_test_3',
+        merchant: 'Target Beauty',
+        purchaseDate: DateTime(2026, 10, 20),
+        currency: '\$',
+        subtotal: 50.00,
+        tax: 0.0,
+        discount: 0.0,
+        total: 50.00,
+        items: [
+          const ReceiptItemModel(
+            itemId: 'item_1',
+            description: 'Lip Gloss',
+            quantity: 1,
+            unitPrice: 20.00,
+            totalPrice: 20.00,
+          ),
+        ],
+        rawText: 'Lip Gloss 20.00\nTotal 50.00',
+      );
+
+      await pumpReview(tester, draft);
+
+      // Tap Add Item button
+      final addBtn = find.text('Add Item');
+      expect(addBtn, findsOneWidget);
+      await tester.tap(addBtn);
+      await tester.pumpAndSettle();
+
+      final matchingWidgets = find.byWidgetPredicate(
+        (w) => w is TextField && w.key is Key && (w.key as Key).toString().contains('line-price-line_added_'),
+      );
+      expect(matchingWidgets, findsOneWidget);
+      final widget = tester.widget<TextField>(matchingWidgets);
+      expect(widget.controller?.text, '30.00'); // 50.00 - 20.00 = 30.00
+    });
   });
 }
+

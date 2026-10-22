@@ -1,7 +1,9 @@
 import 'dart:ui' as ui;
 import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
 import '../models/product_model.dart';
 import '../screens/receipt/receipt_scanner_screen.dart' show PickedReceiptImage, pickReceiptImageWithFilePicker;
+import 'image_capture_service.dart';
 import 'ocr/packaging_image_prep.dart';
 import 'ocr/receipt_ocr_service.dart';
 
@@ -42,8 +44,19 @@ class PackagingOcrService {
   @visibleForTesting
   static Future<PreparedImage> Function(Uint8List bytes, {int quarterTurns, ui.Rect? crop, bool enhance})? debugPrepare;
 
-  /// Lets the user pick a packaging photo (bytes on web, bytes + path on Android).
-  static Future<PickedReceiptImage?> pickImage() => (debugPicker ?? pickReceiptImageWithFilePicker)();
+  /// Lets the user pick a packaging photo (via Camera or Gallery/Files, or debugPicker in tests).
+  static Future<PickedReceiptImage?> pickImage({BuildContext? context}) {
+    if (debugPicker != null) return debugPicker!();
+    if (context != null) {
+      return ImageCaptureService.pickImageWithSourceChoice(
+        context,
+        title: 'Packaging Photo',
+        cameraLabel: 'Take Photo of Packaging',
+        galleryLabel: 'Choose from Gallery / Files',
+      );
+    }
+    return pickReceiptImageWithFilePicker();
+  }
 
   /// Reads a packaging image in at most two passes with the platform OCR engine (ML Kit
   /// on Android/iOS, self-hosted Tesseract.js in the browser):
@@ -94,8 +107,8 @@ class PackagingOcrService {
 
   /// Lets the user pick a packaging photo and returns its recognized text, or null if the
   /// user cancelled. Throws when OCR fails.
-  static Future<String?> pickAndRead() async {
-    final image = await (debugPicker ?? pickReceiptImageWithFilePicker)();
+  static Future<String?> pickAndRead({BuildContext? context}) async {
+    final image = await pickImage(context: context);
     if (image == null) return null;
     return ReceiptOcrService.recognize(filePath: image.path, bytes: image.bytes, mimeType: image.mimeType);
   }

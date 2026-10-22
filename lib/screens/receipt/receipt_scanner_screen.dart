@@ -5,6 +5,7 @@ import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:provider/provider.dart';
 import '../../models/receipt_model.dart';
 import '../../providers/vanity_provider.dart';
+import '../../services/image_capture_service.dart';
 import '../../services/ocr/receipt_ocr_service.dart';
 import '../../services/product_lookup_service.dart';
 import '../../services/receipt_parser_service.dart';
@@ -171,10 +172,37 @@ class _ReceiptScannerScreenState extends State<ReceiptScannerScreen>
 
   // --- OCR Image Methods ---
 
+  Future<void> _captureReceiptWithCamera() async {
+    PickedReceiptImage? image;
+    try {
+      image = await ImageCaptureService.captureWithCamera();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _errorMessage = 'Could not capture photo: ${_clean(e)}';
+        _showManualInput = true;
+      });
+      return;
+    }
+    if (image == null) return; // user cancelled
+
+    if (image.bytes.isEmpty) {
+      if (!mounted) return;
+      setState(() {
+        _errorMessage = 'The captured image is empty or could not be read.';
+        _showManualInput = true;
+      });
+      return;
+    }
+
+    _lastImage = image;
+    await _runOcr(image);
+  }
+
   Future<void> _pickReceiptImage() async {
     PickedReceiptImage? image;
     try {
-      image = await (widget.pickImage ?? pickReceiptImageWithFilePicker)();
+      image = await (widget.pickImage ?? ImageCaptureService.pickFromGallery)();
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -527,11 +555,34 @@ class _ReceiptScannerScreenState extends State<ReceiptScannerScreen>
               ),
               const SizedBox(height: 16),
             ],
-            ElevatedButton.icon(
-              onPressed: _pickReceiptImage,
-              icon: const Icon(Icons.photo_library_rounded),
-              label: Text(_lastImage == null ? 'Select Receipt Image' : 'Select Another Image'),
-              style: ElevatedButton.styleFrom(padding: const EdgeInsets.symmetric(vertical: 16)),
+            Row(
+              children: [
+                Expanded(
+                  child: ElevatedButton.icon(
+                    key: const Key('receipt-camera-button'),
+                    onPressed: _captureReceiptWithCamera,
+                    icon: const Icon(Icons.camera_alt_rounded),
+                    label: Text(_lastImage == null ? 'Take Photo' : 'Retake Photo'),
+                    style: ElevatedButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(vertical: 16),
+                      backgroundColor: AppTheme.primaryRose,
+                      foregroundColor: Colors.white,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: OutlinedButton.icon(
+                    key: const Key('receipt-gallery-button'),
+                    onPressed: _pickReceiptImage,
+                    icon: const Icon(Icons.photo_library_rounded),
+                    label: Text(_lastImage == null ? 'Select Receipt Image' : 'Select Another Image'),
+                    style: OutlinedButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(vertical: 16),
+                    ),
+                  ),
+                ),
+              ],
             ),
             const SizedBox(height: 16),
             OutlinedButton.icon(
